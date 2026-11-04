@@ -36,7 +36,7 @@ not indexed shows **Explore now**, and stale maps offer **Refresh**.
 
 | Indexing option | Default | Meaning |
 | --- | --- | --- |
-| `--depth N` | 2 | Levels to map: 1 = system, 2 = system and its components, … |
+| `--depth N\|full` | 2 | Levels to map: 1 = system, 2 = system and its components, …; `full` maps the whole hierarchy |
 | `--jobs N` | 4 | Explorations running at the same time |
 | `--min-lines N` | 300 | Components with fewer text lines stay leaves (the source view covers them) |
 | `--index-only` | | Index and exit (exit code 1 if any exploration failed) |
@@ -45,6 +45,14 @@ Indexing is resumable and incremental: fresh maps are skipped, so re-running aft
 interruption or a commit only explores what is missing or changed. For reference,
 `sre-agent` (≈850 files) indexed at depth 2 in about 16 minutes with 9 explorations
 and 3.5M input tokens.
+
+With `--depth full`, recursion stops at a component that is not explorable, is an
+external system or actor, has fewer than `--min-lines` lines, or covers no fewer
+files than the map it appears in. The last rule guarantees termination: every level
+covers strictly fewer files. Full depth can mean dozens to hundreds of explorations
+(each typically 2–7 minutes and 150–700k input tokens), so a common pattern is to
+index at depth 2 first and deepen later: maps already cached are reused, and only
+the new levels are explored. Raise `--min-lines` to keep the hierarchy coarser.
 
 Other options: `--port`, `--host` (keep loopback; the API serves repository files),
 `--open`, `--model`, `--codex <path>`, `--timeout-mins` (per exploration or question,

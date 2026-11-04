@@ -1,6 +1,10 @@
 //! Full-project indexing: explore the system map and then, level by level, every
 //! component worth a deeper map, so browsing afterwards is served from the cache.
 //! Fresh maps are skipped, which makes indexing resumable and incremental.
+//!
+//! Recursion ends at nodes that are not explorable, external, below the size floor
+//! or not narrower than the map they appear in. The last rule guarantees that even
+//! unlimited depth terminates: every level covers strictly fewer files.
 
 use crate::explore::Explorer;
 use crate::map::Map;
@@ -11,8 +15,9 @@ use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 pub struct Options {
-    /// Levels to map: 1 = system only, 2 = system and its components, …
-    pub depth: usize,
+    /// Levels to map (1 = system only, 2 = system and its components, …);
+    /// `None` recurses until no component qualifies.
+    pub depth: Option<usize>,
     /// Explorations running at the same time.
     pub jobs: usize,
     /// Components with fewer text lines are left as leaves (the source view covers them).
@@ -25,6 +30,8 @@ pub struct Summary {
     pub cached: usize,
     pub failed: usize,
     pub skipped_small: usize,
+    pub skipped_not_narrower: usize,
+    pub deepest: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
@@ -46,15 +53,23 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
+struct Item {
+    scope: String,
+    label: String,
+    /// Files covered by the scope; children must cover fewer.
+    files: usize,
+}
+
 struct Queue {
-    pending: VecDeque<(String, String)>,
+    pending: VecDeque<Item>,
     seen: HashSet<String>,
 }
 
 impl Queue {
-    /// Child scopes of a finished map that pass the depth limit and size floor.
-    fn children(&mut self, ex: &Explorer, opts: &Options, scope: &str, map: &Map, summary: &mut Summary) {
-        if level(scope) >= opts.depth {
+    /// Child scopes of a finished map that pass the depth limit, size floor and narrowing rule.
+    fn children(&mut self, ex: &Explorer, opts: &Options, parent: &Item, map: &Map, summary: &mut Summary) {
+        summary.deepest = summary.deepest.max(level(&parent.scope));
+        if opts.depth.is_some_and(|d| level(&parent.scope) >= d) {
             return;
         }
         let trail = map.meta.as_ref().map(|m| m.crumbs.join(" › ")).unwrap_or_default();
@@ -62,15 +77,20 @@ impl Queue {
             if !node.explorable || node.paths.is_empty() || matches!(node.kind.as_str(), "external" | "actor") {
                 continue;
             }
-            let child = if scope.is_empty() { node.id.clone() } else { format!("{scope}/{}", node.id) };
-            if !self.seen.insert(child.clone()) {
+            let scope = if parent.scope.is_empty() { node.id.clone() } else { format!("{}/{}", parent.scope, node.id) };
+            if !self.seen.insert(scope.clone()) {
+                continue;
+            }
+            let files = ex.repo.manifest(&node.paths).len();
+            if files >= parent.files {
+                summary.skipped_not_narrower += 1;
                 continue;
             }
             if ex.repo.line_count(&node.paths, opts.min_lines) < opts.min_lines {
                 summary.skipped_small += 1;
                 continue;
             }
-            self.pending.push_back((child, format!("{trail} › {}", node.name)));
+            self.pending.push_back(Item { scope, label: format!("{trail} › {}", node.name), files });
         }
     }
 }
@@ -78,46 +98,47 @@ impl Queue {
 pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
     let started = Instant::now();
     let mut summary = Summary::default();
-    let mut queue = Queue { pending: VecDeque::from([(String::new(), ex.repo.name.clone())]), seen: HashSet::new() };
-    let mut running: JoinSet<(String, String, Duration, Result<Map, String>)> = JoinSet::new();
+    let root = Item { scope: String::new(), label: ex.repo.name.clone(), files: ex.repo.manifest(&[".".to_owned()]).len() };
+    let mut queue = Queue { pending: VecDeque::from([root]), seen: HashSet::new() };
+    let mut running: JoinSet<(Item, Duration, Result<Map, String>)> = JoinSet::new();
     println!(
         "indexing {} (depth {}, {} parallel, components under {} lines stay leaves)",
         ex.repo.root.display(),
-        opts.depth,
+        opts.depth.map_or_else(|| "full".to_owned(), |d| d.to_string()),
         opts.jobs,
         opts.min_lines
     );
 
     loop {
         while running.len() < opts.jobs.max(1) {
-            let Some((scope, label)) = queue.pending.pop_front() else { break };
-            if let Some(cached) = ex.cache.load(&ex.repo, &scope) {
+            let Some(item) = queue.pending.pop_front() else { break };
+            if let Some(cached) = ex.cache.load(&ex.repo, &item.scope) {
                 if cached.freshness == crate::cache::Freshness::Fresh {
                     summary.cached += 1;
-                    println!("  = {label} (cached)");
-                    queue.children(&ex, &opts, &scope, &cached.map, &mut summary);
+                    println!("  = {} (cached)", item.label);
+                    queue.children(&ex, &opts, &item, &cached.map, &mut summary);
                     continue;
                 }
             }
-            let lineage = if scope.is_empty() {
+            let lineage = if item.scope.is_empty() {
                 None
             } else {
-                match ex.lineage(&scope) {
+                match ex.lineage(&item.scope) {
                     Ok(l) => Some(l),
                     Err(e) => {
                         summary.failed += 1;
-                        println!("  ✗ {label}: {e}");
+                        println!("  ✗ {}: {e}", item.label);
                         continue;
                     }
                 }
             };
-            println!("  → {label}");
+            println!("  → {}", item.label);
             let ex = ex.clone();
             running.spawn(async move {
                 let t = Instant::now();
                 let cancel = Notify::new();
-                let result = ex.explore(&scope, lineage.as_ref(), &cancel, |_| {}).await;
-                (scope, label, t.elapsed(), result)
+                let result = ex.explore(&item.scope, lineage.as_ref(), &cancel, |_| {}).await;
+                (item, t.elapsed(), result)
             });
         }
         if running.is_empty() {
@@ -131,7 +152,7 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
             }
         };
         let Some(joined) = joined else { break };
-        let (scope, label, took, result) = joined.map_err(|e| format!("index task failed: {e}"))?;
+        let (item, took, result) = joined.map_err(|e| format!("index task failed: {e}"))?;
         match result {
             Ok(map) => {
                 summary.explored += 1;
@@ -140,7 +161,8 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
                 summary.input_tokens += input;
                 summary.output_tokens += output;
                 println!(
-                    "  ✓ {label} ({}, {} nodes, {} in / {} out tokens) [{} queued, {} running]",
+                    "  ✓ {} ({}, {} nodes, {} in / {} out tokens) [{} queued, {} running]",
+                    item.label,
                     fmt_duration(took),
                     map.nodes.len(),
                     fmt_tokens(input),
@@ -148,21 +170,23 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
                     queue.pending.len(),
                     running.len()
                 );
-                queue.children(&ex, &opts, &scope, &map, &mut summary);
+                queue.children(&ex, &opts, &item, &map, &mut summary);
             }
             Err(e) => {
                 summary.failed += 1;
-                println!("  ✗ {label}: {e}");
+                println!("  ✗ {}: {e}", item.label);
             }
         }
     }
     println!(
-        "indexed in {}: {} explored, {} already cached, {} failed, {} small components left as leaves; {} in / {} out tokens",
+        "indexed in {}: {} explored, {} already cached, {} failed, {} levels deep; leaves: {} small, {} not narrower than their parent; {} in / {} out tokens",
         fmt_duration(started.elapsed()),
         summary.explored,
         summary.cached,
         summary.failed,
+        summary.deepest,
         summary.skipped_small,
+        summary.skipped_not_narrower,
         fmt_tokens(summary.input_tokens),
         fmt_tokens(summary.output_tokens)
     );

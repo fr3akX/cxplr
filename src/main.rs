@@ -49,9 +49,10 @@ struct Args {
     /// Index and exit without serving
     #[arg(long, conflicts_with = "index")]
     index_only: bool,
-    /// Levels to index: 1 = system map, 2 = system and its components, …
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=6))]
-    depth: u16,
+    /// Levels to index: 1 = system map, 2 = system and its components, …, or `full`
+    /// to recurse until no component is explorable, large enough and narrower than its parent
+    #[arg(long, default_value = "2", value_name = "N|full", value_parser = parse_depth)]
+    depth: Depth,
     /// Explorations to run at the same time while indexing
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=16))]
     jobs: u16,
@@ -68,6 +69,22 @@ struct Args {
     /// Disable language servers; navigation falls back to text search
     #[arg(long)]
     no_lsp: bool,
+}
+
+/// Index depth: a level count, or `None` for the full hierarchy.
+#[derive(Clone, Copy)]
+struct Depth(Option<usize>);
+
+fn parse_depth(raw: &str) -> Result<Depth, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "full" | "all" => Ok(Depth(None)),
+        n => n
+            .parse::<usize>()
+            .ok()
+            .filter(|&d| d >= 1)
+            .map(|d| Depth(Some(d)))
+            .ok_or_else(|| format!("expected a number of levels (1, 2, …) or `full`, got `{raw}`")),
+    }
 }
 
 fn parse_lsp(raw: &str) -> Result<(String, String), String> {
@@ -116,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cxplr: {} ({commit}), cache {}", ex.repo.root.display(), cache_dir.display());
 
     if args.index || args.index_only {
-        let opts = index::Options { depth: args.depth.into(), jobs: args.jobs.into(), min_lines: args.min_lines };
+        let opts = index::Options { depth: args.depth.0, jobs: args.jobs.into(), min_lines: args.min_lines };
         let summary = index::run(ex.clone(), opts).await?;
         if args.index_only {
             std::process::exit(i32::from(summary.failed > 0));
