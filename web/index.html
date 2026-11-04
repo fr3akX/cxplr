@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Code Explorer</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <span class="brand">Code Explorer</span>
+    <nav id="crumbs" aria-label="Zoom level"></nav>
+    <span class="spacer"></span>
+    <label class="toggle"><input type="checkbox" id="labels" checked> Edge labels</label>
+    <button id="fit" type="button" title="Fit map to screen (F)">Fit</button>
+    <span id="repo" class="muted"></span>
+  </header>
+  <main>
+    <section id="stage">
+      <svg id="graph" role="img" aria-label="Architecture map">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow"></path>
+          </marker>
+          <marker id="arrow-hi" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class="arrow-hi"></path>
+          </marker>
+        </defs>
+        <g id="viewport">
+          <g id="edges"></g>
+          <g id="nodes"></g>
+          <g id="overlay"></g>
+        </g>
+      </svg>
+      <div id="screen" hidden></div>
+    </section>
+    <aside id="panel"></aside>
+  </main>
+  <div id="modal" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="src-path">
+      <div class="modal-head">
+        <span id="src-path"></span>
+        <button id="src-close" type="button" title="Close (Esc)">Close</button>
+      </div>
+      <div id="src-body"></div>
+    </div>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
