@@ -42,7 +42,9 @@ a few minutes on a mid-size repository; progress shows each command Codex runs.
   Breadcrumbs at the top go back up.
 - Click a data flow: its steps are highlighted and numbered on the map.
 - Click a citation or path: source viewer at that line.
-- Mouse wheel zooms, drag pans, `F` fits, `Esc` clears the selection.
+- Drag a box to move it when labels overlap; edges follow. Positions are saved per
+  map (repository, commit, level) in browser storage. **Reset layout** discards them.
+- Mouse wheel zooms, dragging the background pans, `F` fits, `Esc` clears the selection.
 
 ## Trust model
 

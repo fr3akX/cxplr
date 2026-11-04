@@ -371,9 +371,53 @@ function edgePath(L, e, offset) {
 
 // ---------- graph rendering ----------
 
+function layoutKey() {
+  return `code-explore:layout:${state.repo?.root}@${state.repo?.commit || 'no-commit'}:${state.scope}`;
+}
+
+/** Positions the user dragged, keyed by node id (box centres). */
+function savedPositions() {
+  try {
+    return JSON.parse(localStorage.getItem(layoutKey())) || null;
+  } catch {
+    return null;
+  }
+}
+
+function savePositions() {
+  const at = state.layout.at;
+  const positions = Object.fromEntries(Object.entries(at).map(([id, p]) => [id, [Math.round(p.cx), Math.round(p.cy)]]));
+  try {
+    localStorage.setItem(layoutKey(), JSON.stringify(positions));
+  } catch {
+    // Storage full or disabled: the drag still applies for this view.
+  }
+  state.customLayout = true;
+}
+
+function moveNode(p, cx, cy) {
+  p.cx = cx;
+  p.cy = cy;
+  p.x = cx - p.w / 2;
+  p.y = cy - p.h / 2;
+}
+
+function computeLayout(map) {
+  const L = layout(map);
+  const saved = savedPositions();
+  state.customLayout = false;
+  for (const [id, [cx, cy]] of Object.entries(saved || {})) {
+    if (L.at[id] && Number.isFinite(cx) && Number.isFinite(cy)) {
+      moveNode(L.at[id], cx, cy);
+      state.customLayout = true;
+    }
+  }
+  return L;
+}
+
 function showMap(map) {
   state.map = map;
-  state.layout = layout(map);
+  state.layout = computeLayout(map);
   const crumbs = map.meta?.crumbs;
   if (crumbs) {
     const ids = state.scope ? state.scope.split('/') : [];
@@ -388,6 +432,12 @@ function showMap(map) {
 }
 
 function renderGraph() {
+  renderNodes();
+  renderEdges();
+}
+
+/** Edge geometry follows node positions; called again while a node is dragged. */
+function renderEdges() {
   const { map, layout: L } = state;
   const pairCount = new Map();
   const pairSeen = new Map();
@@ -414,12 +464,20 @@ function renderGraph() {
       <text class="label" x="${g.mid[0]}" y="${g.mid[1] - 5}" text-anchor="middle">${esc(trunc(e.label, 30))}</text>
     </g>`;
   }).join('');
+  applyHighlight();
+}
 
+function nodeTransform(p) {
+  return `translate(${p.x},${p.y})`;
+}
+
+function renderNodes() {
+  const { map, layout: L } = state;
   $('#nodes').innerHTML = map.nodes.map((node) => {
     const p = L.at[node.id];
     const drill = node.paths.length > 0;
-    return `<g class="node ${esc(node.kind)}" data-node="${esc(node.id)}" transform="translate(${p.x},${p.y})" style="--kc:${kindColor(node.kind)}">
-      <title>${esc(node.name)}${drill ? ' (double-click to explore inside)' : ''}</title>
+    return `<g class="node ${esc(node.kind)}" data-node="${esc(node.id)}" transform="${nodeTransform(p)}" style="--kc:${kindColor(node.kind)}">
+      <title>${esc(node.name)} (drag to move${drill ? ', double-click to explore inside' : ''})</title>
       <rect class="box" width="${p.w}" height="${p.h}" rx="9"></rect>
       <rect class="band" width="5" height="${p.h - 16}" x="0" y="8" rx="2"></rect>
       <text class="name" x="16" y="23">${esc(p.name)}</text>
@@ -427,7 +485,6 @@ function renderGraph() {
       ${drill ? `<text class="drill" x="${p.w - 12}" y="41" text-anchor="end">${node.explorable ? 'explore ›' : '›'}</text>` : ''}
     </g>`;
   }).join('');
-  applyHighlight();
 }
 
 function applyHighlight() {
@@ -534,30 +591,59 @@ svg.addEventListener('wheel', (e) => {
   applyView();
 }, { passive: false });
 
+// Dragging a node moves it (edges follow); dragging the background pans.
 let drag = null;
+let edgeFrame = 0;
+let suppressClick = false; // the click that ends a drag must not select
 svg.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
+  suppressClick = false;
+  const nodeEl = e.target.closest('[data-node]');
+  const p = nodeEl && state.layout?.at[nodeEl.dataset.node];
   drag = { x: e.clientX, y: e.clientY, vx: state.view.x, vy: state.view.y, moved: false };
+  if (p) Object.assign(drag, { el: nodeEl, p, cx: p.cx, cy: p.cy });
 });
 window.addEventListener('pointermove', (e) => {
   if (!drag) return;
+  if (!(e.buttons & 1)) return endDrag(); // button released outside the page
   const dx = e.clientX - drag.x;
   const dy = e.clientY - drag.y;
   if (!drag.moved && Math.hypot(dx, dy) < 4) return;
   if (!drag.moved) svg.setPointerCapture?.(e.pointerId);
   drag.moved = true;
+  if (drag.p) {
+    if (!drag.el.classList.contains('dragging')) {
+      drag.el.classList.add('dragging');
+      drag.el.parentNode.appendChild(drag.el); // draw above the other boxes
+    }
+    moveNode(drag.p, drag.cx + dx / state.view.k, drag.cy + dy / state.view.k);
+    drag.el.setAttribute('transform', nodeTransform(drag.p));
+    if (!edgeFrame) edgeFrame = requestAnimationFrame(() => { edgeFrame = 0; renderEdges(); });
+    return;
+  }
   svg.classList.add('panning');
   state.view.x = drag.vx + dx;
   state.view.y = drag.vy + dy;
   applyView();
 });
-window.addEventListener('pointerup', () => {
+function endDrag() {
   svg.classList.remove('panning');
-  setTimeout(() => { drag = null; }, 0);
-});
+  if (drag?.p && drag.moved) {
+    drag.el.classList.remove('dragging');
+    savePositions();
+    if (!state.selected && state.flow === null) renderPanel(); // shows “Reset layout”
+  }
+  suppressClick = !!drag?.moved;
+  drag = null;
+}
+window.addEventListener('pointerup', endDrag);
+window.addEventListener('pointercancel', endDrag);
 
 svg.addEventListener('click', (e) => {
-  if (drag?.moved) return;
+  if (suppressClick) {
+    suppressClick = false;
+    return;
+  }
   const nodeEl = e.target.closest('[data-node]');
   const edgeEl = e.target.closest('[data-edge]');
   state.flow = null;
@@ -654,7 +740,8 @@ function renderPanelContent() {
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>
-    <div class="actions"><button data-act="reexplore" type="button">Re-explore</button></div>
+    <div class="actions"><button data-act="reexplore" type="button">Re-explore</button>
+      ${state.customLayout ? '<button data-act="reset-layout" type="button" title="Discard dragged positions">Reset layout</button>' : ''}</div>
     <h3>Data flows</h3>
     ${map.flows.length ? '<ul class="list">' + map.flows.map((f, i) => `<li class="click ${i === state.flow ? 'active' : ''}" data-flow="${i}">
         <b>${esc(f.name)}</b><div class="muted">${esc(f.description)}</div></li>`).join('') + '</ul>' : '<p class="muted">None identified.</p>'}
@@ -671,6 +758,7 @@ function renderPanelContent() {
       <ul>${map.diagnostics.map((d) => `<li class="meta">${esc(d)}</li>`).join('')}</ul></details>` : ''}
     <h3>How to read</h3>
     <p class="meta">Click a box or arrow for details and evidence. Double-click a box, or use “Explore inside”, to zoom in one level.
+      Drag a box to move it; positions are kept per map in this browser.
       Arrows point the way requests or data travel. Dashed boxes are external systems or actors.</p>
     <div class="legend">
       ${legendLine('call / http / rpc', '')}${legendLine('event / queue', '7 4')}
@@ -692,7 +780,15 @@ $('#panel').addEventListener('click', (e) => {
   else if (t.dataset.flow !== undefined) { const i = Number(t.dataset.flow); state.selected = null; state.flow = state.flow === i ? null : i; }
   else if (t.dataset.act === 'back') state.selected = null;
   else if (t.dataset.act === 'drill') return go(childScope(state.selected.id));
-  else if (t.dataset.act === 'reexplore') return start(state.scope, true);
+  else if (t.dataset.act === 'reexplore') {
+    localStorage.removeItem(layoutKey()); // node ids may mean something else in the new map
+    return start(state.scope, true);
+  } else if (t.dataset.act === 'reset-layout') {
+    localStorage.removeItem(layoutKey());
+    state.layout = computeLayout(state.map);
+    renderGraph();
+    fit();
+  }
   applyHighlight();
   renderPanel();
 });
