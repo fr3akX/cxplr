@@ -5,6 +5,9 @@
 use crate::map::{Map, Node};
 use std::fmt::Write;
 
+/// Part of every cache key: bump when prompts or the map schema change meaning.
+pub const VERSION: &str = "1";
+
 const RULES: &str = "\
 You are mapping a software repository so a developer can learn it top-down. The repository \
 root is the current working directory. Explore it with read-only shell commands (ls, rg, \
@@ -33,7 +36,7 @@ files, modules or classes); false for small single files, external systems and a
 - When something is inferred rather than seen in code or config, write \"(inferred)\" in \
 the summary or label.
 - Ignore vendored, generated and build output (node_modules, target, dist, build, .git, \
-lock files).
+.code-xplr, lock files).
 ";
 
 pub fn system(repo_name: &str) -> String {

@@ -116,6 +116,14 @@ code a.loc, a.loc code { font-size: inherit; }
 .node text.name { font-weight: 600; font-size: 13px; fill: var(--fg); }
 .node text.kind { font-size: 11px; fill: var(--muted); }
 .node text.drill { font-size: 11px; fill: var(--kc, var(--accent)); font-weight: 600; }
+.node text.drill.none { fill: var(--muted); font-weight: 500; }
+.node text.drill.stale { fill: var(--warn); }
+.path-link.drill-none { color: var(--muted); }
+.path-link.drill-stale { color: var(--warn); }
+.stale { border: 1px solid var(--warn); border-radius: 8px; padding: 8px 10px; margin: 10px 0; font-size: 12.5px; }
+.stale b { color: var(--warn); }
+.stale details { margin-top: 6px; }
+.stale ul.changed { margin: 6px 0 0; padding-left: 18px; max-height: 180px; overflow-y: auto; }
 .node { cursor: pointer; }
 .node.dragging { cursor: grabbing; }
 .node.dragging rect.box { stroke-width: 2.6; filter: drop-shadow(0 4px 8px rgba(0, 0, 0, .25)); }
@@ -137,6 +145,32 @@ code a.loc, a.loc code { font-size: inherit; }
 .step-badge circle { fill: var(--accent); }
 .step-badge text { fill: #fff; font-size: 11px; font-weight: 700; }
 .labels-off .edge text.label { display: none; }
+.sim-track { fill: none; stroke: none; }
+.sim-token { pointer-events: none; transition: opacity .15s; }
+.sim-token circle { fill: var(--tc, var(--accent)); stroke: var(--bg); stroke-width: 2; }
+.sim-token text { fill: #fff; font-size: 9px; font-weight: 700; }
+.node.sim-hit rect.box { animation: sim-hit .7s ease-out; }
+@keyframes sim-hit { 0% { stroke-width: 6; filter: drop-shadow(0 0 8px var(--kc, var(--accent))); } 100% { stroke-width: 1.6; } }
+.sim-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.sim-controls input, .sim-controls select {
+  font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 1px 4px;
+}
+.sim-controls input { width: 52px; }
+.flow-item { display: block; }
+.flow-item .play { float: right; padding: 1px 8px; font-size: 11px; margin-left: 8px; }
+#flow-steps li.sim-active { border-color: var(--accent); background: var(--accent-soft); }
+.scenarios li.scenario { border: 1px solid var(--border); border-left: 4px solid var(--tc); padding: 8px 10px; }
+.sc-head { display: flex; align-items: center; gap: 8px; }
+.sc-head b { flex: 1; }
+.sc-head .play { padding: 1px 8px; font-size: 11px; }
+.sc-dot { display: inline-flex; width: 18px; height: 18px; border-radius: 50%; background: var(--tc); color: #fff; font-size: 10px; font-weight: 700; align-items: center; justify-content: center; flex: none; }
+.sc-io { font-size: 12.5px; margin-top: 4px; word-break: break-word; }
+.sc-now { font-size: 12.5px; margin-top: 4px; }
+.sc-now:empty { display: none; }
+.sc-steps { padding-left: 20px; margin: 6px 0 0; }
+.sc-steps > li { margin: 6px 0; }
+pre.payload { background: var(--code-bg); border-radius: 5px; padding: 4px 8px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; font-size: 11.5px; max-height: 140px; overflow: auto; }
+.error-text { color: var(--err); white-space: pre-wrap; }
 
 /* screens over the stage */
 #screen {

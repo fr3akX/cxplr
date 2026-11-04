@@ -1,12 +1,10 @@
 //! Local HTTP API and embedded web UI. Explorations and questions run as
 //! background jobs that the UI polls; source navigation goes through LSP.
 
-use crate::agent::{self, AgentConfig};
-use crate::cache::Cache;
+use crate::agent;
+use crate::explore::{Explorer, Lineage};
 use crate::lsp::Lsp;
-use crate::map::{self, Map, Meta, Node};
-use crate::repo::Repo;
-use crate::{ask, prompt, search, verify};
+use crate::{ask, search, trace, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,7 +16,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
@@ -26,13 +24,19 @@ const MAX_PROGRESS: usize = 5000;
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
 pub struct AppState {
-    repo: Repo,
-    cache: Cache,
-    agent: AgentConfig,
+    ex: Arc<Explorer>,
     lsp: Lsp,
-    map_schema: PathBuf,
     ask_schema: PathBuf,
+    trace_schema: PathBuf,
     jobs: Mutex<Jobs>,
+}
+
+/// Handlers use the explorer's repository, cache and agent settings directly.
+impl std::ops::Deref for AppState {
+    type Target = Explorer;
+    fn deref(&self) -> &Explorer {
+        &self.ex
+    }
 }
 
 #[derive(Default)]
@@ -69,22 +73,9 @@ impl Job {
     }
 }
 
-pub struct Schemas {
-    pub map: PathBuf,
-    pub ask: PathBuf,
-}
-
 impl AppState {
-    pub fn new(repo: Repo, cache: Cache, agent: AgentConfig, lsp: Lsp, schemas: Schemas) -> Arc<AppState> {
-        Arc::new(AppState {
-            repo,
-            cache,
-            agent,
-            lsp,
-            map_schema: schemas.map,
-            ask_schema: schemas.ask,
-            jobs: Mutex::default(),
-        })
+    pub fn new(ex: Arc<Explorer>, lsp: Lsp, ask_schema: PathBuf, trace_schema: PathBuf) -> Arc<AppState> {
+        Arc::new(AppState { ex, lsp, ask_schema, trace_schema, jobs: Mutex::default() })
     }
 
     fn running_job(&self, scope: &str) -> Option<u64> {
@@ -121,7 +112,7 @@ impl AppState {
                 }
             }
         }
-        if job.kind == "explore" {
+        if job.kind != "ask" {
             self.jobs.lock().unwrap().running.remove(&job.scope);
         }
     }
@@ -144,6 +135,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/map", get(get_map))
         .route("/api/explore", post(explore))
         .route("/api/ask", post(ask_question))
+        .route("/api/trace", get(get_trace).post(start_trace))
         .route("/api/job/{id}", get(job_status))
         .route("/api/job/{id}/cancel", post(cancel_job))
         .route("/api/source", get(source))
@@ -167,8 +159,9 @@ async fn repo_info(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "name": st.repo.name,
         "root": st.repo.root,
-        "commit": st.repo.commit,
+        "commit": st.repo.head(),
         "model": st.agent.model,
+        "cache": st.cache.dir(),
     }))
 }
 
@@ -178,14 +171,25 @@ struct ScopeQuery {
     scope: String,
 }
 
+/// Cached map (fresh or stale) plus which of its nodes already have a cached map.
 async fn get_map(State(st): State<Arc<AppState>>, Query(q): Query<ScopeQuery>) -> Json<Value> {
     if let Some(job) = st.running_job(&q.scope) {
         return Json(json!({ "status": "running", "job": job }));
     }
-    match st.cache.load(&q.scope) {
-        Some(map) => Json(json!({ "status": "ready", "map": map })),
-        None => Json(json!({ "status": "missing" })),
-    }
+    let Some(cached) = st.cache.load(&st.repo, &q.scope) else {
+        return Json(json!({ "status": "missing" }));
+    };
+    let children: serde_json::Map<String, Value> = cached
+        .map
+        .nodes
+        .iter()
+        .filter(|n| !n.paths.is_empty())
+        .filter_map(|n| {
+            let child = if q.scope.is_empty() { n.id.clone() } else { format!("{}/{}", q.scope, n.id) };
+            st.cache.state(&st.repo, &child).map(|s| (n.id.clone(), json!(s)))
+        })
+        .collect();
+    Json(json!({ "status": "ready", "map": cached.map, "freshness": cached.freshness, "children": children }))
 }
 
 #[derive(Deserialize)]
@@ -196,52 +200,18 @@ struct ExploreRequest {
     force: bool,
 }
 
-/// Everything needed to explore one scope below the system map.
-struct Lineage {
-    crumbs: Vec<(String, String)>,
-    parent: Map,
-    node: Node,
-}
-
-fn lineage(cache: &Cache, scope: &str) -> Result<Lineage, String> {
-    let ids: Vec<&str> = scope.split('/').collect();
-    if ids.iter().any(|id| id.is_empty()) {
-        return Err(format!("invalid scope `{scope}`"));
-    }
-    let mut map = cache.load("").ok_or("the system map has not been explored yet")?;
-    let mut crumbs = vec![(map.title.clone(), map.summary.clone())];
-    for (depth, id) in ids.iter().enumerate() {
-        let node = map
-            .nodes
-            .iter()
-            .find(|n| n.id == *id)
-            .cloned()
-            .ok_or_else(|| format!("no node `{id}` in the map above it"))?;
-        crumbs.push((node.name.clone(), node.summary.clone()));
-        if depth + 1 == ids.len() {
-            if node.paths.is_empty() {
-                return Err(format!("`{}` has no repository paths to explore", node.name));
-            }
-            return Ok(Lineage { crumbs, parent: map, node });
-        }
-        let above = ids[..=depth].join("/");
-        map = cache.load(&above).ok_or_else(|| format!("`{}` has not been explored yet", node.name))?;
-    }
-    unreachable!("scope has at least one id")
-}
-
 async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest>) -> ApiResult {
     let lineage = if req.scope.is_empty() {
         None
     } else {
-        Some(lineage(&st.cache, &req.scope).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?)
+        Some(st.lineage(&req.scope).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?)
     };
     let job = {
         let mut jobs = st.jobs.lock().unwrap();
         if let Some(&id) = jobs.running.get(&req.scope) {
             return Ok(Json(json!({ "status": "running", "job": id })));
         }
-        if !req.force && st.cache.load(&req.scope).is_some() {
+        if !req.force && st.cache.state(&st.repo, &req.scope).is_some() {
             return Ok(Json(json!({ "status": "ready" })));
         }
         let job = AppState::new_job(&mut jobs, "explore", req.scope.clone());
@@ -254,44 +224,8 @@ async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest
 }
 
 async fn run_job(st: Arc<AppState>, job: Arc<Job>, lineage: Option<Lineage>) {
-    let result = explore_scope(&st, &job, lineage).await;
-    st.finish(&job, result.map(|()| None));
-}
-
-async fn explore_scope(st: &AppState, job: &Job, lineage: Option<Lineage>) -> Result<(), String> {
-    let (prompt, mut crumbs) = match &lineage {
-        None => (prompt::system(&st.repo.name), vec![st.repo.name.clone()]),
-        Some(l) => (
-            prompt::component(&l.crumbs, &l.parent, &l.node),
-            l.crumbs.iter().map(|(name, _)| name.clone()).collect(),
-        ),
-    };
-    job.push(format!("Exploring {} with codex (read-only sandbox)", crumbs.join(" › ")));
-    let started = Instant::now();
-    let out = agent::run::<Map>(&st.agent, &st.repo.root, &st.map_schema, &prompt, &job.cancel, |line| job.push(line))
-        .await?;
-
-    job.push("Verifying citations against the repository".into());
-    let mut map = out.answer;
-    map.diagnostics.clear();
-    map::normalize(&mut map);
-    verify::verify(&st.repo.root, &mut map);
-    if lineage.is_none() && !map.title.trim().is_empty() {
-        crumbs[0] = map.title.clone();
-    }
-    map.meta = Some(Meta {
-        scope: job.scope.clone(),
-        crumbs,
-        generated_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
-        commit: st.repo.commit.clone(),
-        dirty: st.repo.is_dirty(),
-        model: st.agent.model.clone(),
-        duration_ms: started.elapsed().as_millis() as u64,
-        commands: out.commands,
-        input_tokens: out.input_tokens,
-        output_tokens: out.output_tokens,
-    });
-    st.cache.store(&job.scope, &map).map_err(|e| format!("saving map: {e}"))
+    let result = st.ex.explore(&job.scope, lineage.as_ref(), &job.cancel, |line| job.push(line)).await;
+    st.finish(&job, result.map(|_| None));
 }
 
 #[derive(Deserialize)]
@@ -354,7 +288,7 @@ async fn answer_question(
     req: ask::Request,
     selection: Option<(String, usize, String)>,
 ) -> Result<Value, String> {
-    let map = st.cache.load(&req.context.scope);
+    let map = st.cache.load(&st.repo, &req.context.scope).map(|c| c.map);
     let node = map.as_ref().zip(req.context.node.as_ref()).and_then(|(m, id)| m.nodes.iter().find(|n| &n.id == id));
     let crumbs = map.as_ref().and_then(|m| m.meta.as_ref()).map_or_else(|| vec![st.repo.name.clone()], |m| m.crumbs.clone());
     let view = ask::View { crumbs, map: map.as_ref(), node, selection };
@@ -375,6 +309,79 @@ async fn answer_question(
         "input_tokens": out.input_tokens,
         "output_tokens": out.output_tokens,
     }))
+}
+
+#[derive(Deserialize)]
+struct TraceRequest {
+    #[serde(default)]
+    scope: String,
+    /// Index into the scope's map flows.
+    flow: usize,
+}
+
+/// The map, chosen flow and cache key for a trace request.
+fn trace_target(st: &AppState, req: &TraceRequest) -> Result<(crate::map::Map, usize, String), (StatusCode, Json<Value>)> {
+    let map = st.cache.load(&st.repo, &req.scope).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this map is not cached"))?.map;
+    let flow = map.flows.get(req.flow).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such flow"))?;
+    let key = st.cache.trace_key(&st.repo, &req.scope, &flow.name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this map is not cached"))?;
+    Ok((map, req.flow, format!("trace:{key}")))
+}
+
+async fn get_trace(State(st): State<Arc<AppState>>, Query(req): Query<TraceRequest>) -> ApiResult {
+    let (_, _, job_key) = trace_target(&st, &req)?;
+    if let Some(job) = st.running_job(&job_key) {
+        return Ok(Json(json!({ "status": "running", "job": job })));
+    }
+    Ok(Json(match st.cache.load_trace(&job_key["trace:".len()..]) {
+        Some(traces) => json!({ "status": "ready", "traces": traces }),
+        None => json!({ "status": "missing" }),
+    }))
+}
+
+async fn start_trace(State(st): State<Arc<AppState>>, Json(req): Json<TraceRequest>) -> ApiResult {
+    let (map, flow, job_key) = trace_target(&st, &req)?;
+    let job = {
+        let mut jobs = st.jobs.lock().unwrap();
+        if let Some(&id) = jobs.running.get(&job_key) {
+            return Ok(Json(json!({ "status": "running", "job": id })));
+        }
+        let job = AppState::new_job(&mut jobs, "trace", job_key.clone());
+        jobs.running.insert(job_key, job.id);
+        job
+    };
+    let id = job.id;
+    tokio::spawn(async move {
+        let result = generate_trace(&st, &job, &map, flow).await;
+        st.finish(&job, result.map(Some));
+    });
+    Ok(Json(json!({ "status": "running", "job": id })))
+}
+
+async fn generate_trace(st: &AppState, job: &Job, map: &crate::map::Map, flow: usize) -> Result<Value, String> {
+    let flow = &map.flows[flow];
+    job.push(format!("Tracing example inputs through “{}” with codex (read-only sandbox)", flow.name));
+    let started = Instant::now();
+    let prompt = trace::prompt(map, flow);
+    let out = agent::run::<trace::Traces>(&st.agent, &st.repo.root, &st.trace_schema, &prompt, &job.cancel, |line| {
+        job.push(line)
+    })
+    .await?;
+    let mut traces = out.answer;
+    traces.diagnostics.clear();
+    trace::normalize(&mut traces, map);
+    for step in traces.scenarios.iter_mut().flat_map(|s| s.steps.iter_mut()) {
+        verify::verify_citations(&st.repo.root, &mut step.evidence);
+    }
+    traces.meta = Some(trace::TraceMeta {
+        flow: flow.name.clone(),
+        generated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        duration_ms: started.elapsed().as_millis() as u64,
+        commands: out.commands,
+        input_tokens: out.input_tokens,
+        output_tokens: out.output_tokens,
+    });
+    st.cache.store_trace(&job.scope["trace:".len()..], &traces).map_err(|e| format!("saving traces: {e}"))?;
+    serde_json::to_value(&traces).map_err(|e| e.to_string())
 }
 
 async fn cancel_job(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) -> ApiResult {
@@ -463,7 +470,7 @@ async fn source(State(st): State<Arc<AppState>>, Query(q): Query<SourceQuery>) -
             .map_err(io)?
             .filter_map(Result::ok)
             .map(|e| (e.path().is_dir(), e.file_name().to_string_lossy().into_owned()))
-            .filter(|(_, name)| name != ".git")
+            .filter(|(_, name)| name != ".git" && name != crate::repo::CACHE_DIR_NAME)
             .collect();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let entries: Vec<Value> = entries.into_iter().map(|(dir, name)| json!({ "name": name, "dir": dir })).collect();

@@ -25,15 +25,30 @@ citation against the files on disk, caches the result and serves the UI.
 
 ```sh
 cargo build --release
-./target/release/code-explore /path/to/repo        # then open http://127.0.0.1:7878
+./target/release/code-explore /path/to/repo --index   # map the project, then open the browser
+./target/release/code-explore /path/to/repo           # browse what is cached: http://127.0.0.1:7878
 ```
 
-Options: `--port`, `--host` (keep loopback; the API serves repository files),
-`--model`, `--codex <path>`, `--timeout-mins` (per exploration or question, default 20),
-`--cache-dir`, `--lsp LANG=COMMAND` (repeatable), `--no-lsp`.
+`--index` explores the system map and then every component worth a deeper map,
+several at a time, prints progress, and opens the browser when done. Browsing then
+reads everything from the cache and never calls Codex on its own: a level that is
+not indexed shows **Explore now**, and stale maps offer **Refresh**.
 
-Opening the UI starts the system exploration if no map is cached. That usually takes
-a few minutes on a mid-size repository; progress shows each command Codex runs.
+| Indexing option | Default | Meaning |
+| --- | --- | --- |
+| `--depth N` | 2 | Levels to map: 1 = system, 2 = system and its components, … |
+| `--jobs N` | 4 | Explorations running at the same time |
+| `--min-lines N` | 300 | Components with fewer text lines stay leaves (the source view covers them) |
+| `--index-only` | | Index and exit (exit code 1 if any exploration failed) |
+
+Indexing is resumable and incremental: fresh maps are skipped, so re-running after an
+interruption or a commit only explores what is missing or changed. For reference,
+`sre-agent` (≈850 files) indexed at depth 2 in about 16 minutes with 9 explorations
+and 3.5M input tokens.
+
+Other options: `--port`, `--host` (keep loopback; the API serves repository files),
+`--open`, `--model`, `--codex <path>`, `--timeout-mins` (per exploration or question,
+default 20), `--cache-dir`, `--lsp LANG=COMMAND` (repeatable), `--no-lsp`.
 
 ## Using the map
 
@@ -45,6 +60,20 @@ a few minutes on a mid-size repository; progress shows each command Codex runs.
 - Drag a box to move it when labels overlap; edges follow. Positions are saved per
   map (repository, commit, level) in browser storage. **Reset layout** discards them.
 - Mouse wheel zooms, dragging the background pans, `F` fits, `Esc` clears the selection.
+- Box labels show whether the inner map is cached: **open ›** (fresh), **open
+  (stale) ›**, or **explore ›** (not explored yet).
+
+## Simulation
+
+Each data flow has **▶**: N inputs (set in **Inputs**, 1–20) travel the flow's steps
+as tokens, staggered, pausing at each box. When a step reaches a component with its
+own cached map, **Follow inside** opens that map and plays the flow there that
+involves the component the input came from.
+
+**Example inputs** under a selected flow asks Codex (read-only, about 1–3 minutes,
+cached) for 2–5 concrete inputs that take different branches: the normal path,
+rejections, failures, retries. Each one has its own lettered token and route, shows
+its data at every hop while it plays, and cites the code that decides each step.
 
 ## Reading source
 
@@ -103,8 +132,19 @@ in the page and is lost on reload.
 
 ## Cache
 
-Maps are stored under `$XDG_CACHE_HOME/code-explore/<repo>-<hash>/<commit>/`, keyed
-by `HEAD` at startup and scope. Restart after checking out another commit.
-Uncommitted changes at exploration time are flagged in the map. **Re-explore**
-replaces the cached map for the current level; deeper maps keep their cached version
-until re-explored.
+Everything is cached in `.code-xplr/` inside the explored directory (it contains its
+own `.gitignore`, so git ignores it; `--cache-dir` puts it elsewhere, e.g. for
+read-only checkouts).
+
+A map's key is its scope plus the content of every file it covers (git blob hashes of
+the working tree), the prompt version and the model. So:
+
+- a component keeps its map across commits, branches and uncommitted edits that do
+  not touch its files; committing changes you already had uncommitted invalidates
+  nothing;
+- when its files change, the last map is still shown, marked stale with the exact
+  files added, removed or changed, until **Refresh** or the next `--index`;
+- going back to earlier content (e.g. checking out an older branch) finds that
+  content's map again.
+
+Example inputs are cached per map content and flow. Delete `.code-xplr/` to start over.

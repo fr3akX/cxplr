@@ -41,7 +41,7 @@ pub fn search(root: &Path, word: &str, limit: usize) -> Results {
     let mut hits = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
-        .filter_entry(|e| e.file_name() != ".git")
+        .filter_entry(|e| e.file_name() != ".git" && e.file_name() != crate::repo::CACHE_DIR_NAME)
         .build();
     for entry in walker.filter_map(Result::ok) {
         if !entry.file_type().is_some_and(|t| t.is_file()) {

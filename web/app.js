@@ -103,6 +103,7 @@ $('#crumbs').addEventListener('click', (e) => {
 
 async function load(scope) {
   clearTimeout(state.poll);
+  stopSim();
   state.scope = scope;
   state.selected = null;
   state.flow = null;
@@ -114,9 +115,29 @@ async function load(scope) {
     return showError(err.message, scope);
   }
   if (state.scope !== scope) return;
-  if (res.status === 'ready') return showMap(res.map);
+  if (res.status === 'ready') {
+    state.freshness = res.freshness;
+    state.children = res.children || {};
+    return showMap(res.map);
+  }
   if (res.status === 'running') return watch(res.job, scope);
-  start(scope, false);
+  showMissing(scope);
+}
+
+/** Never explored: browsing is cache-only, so exploring is an explicit choice. */
+function showMissing(scope) {
+  const parent = scope.includes('/') ? scope.slice(0, scope.lastIndexOf('/')) : '';
+  showScreen(`
+    <h2>${scope ? 'This component has no map yet' : 'This project has no map yet'}</h2>
+    <p class="muted">Exploring runs Codex in a read-only sandbox, typically a few minutes.
+      To map the whole project up front, run <code>code-explore ${esc(state.repo?.root || '.')} --index</code>.</p>
+    <div class="row">
+      <button class="primary" id="explore-now" type="button">Explore now</button>
+      ${scope ? '<button id="up" type="button">Back up one level</button>' : ''}
+    </div>`);
+  renderPanelNote('');
+  $('#explore-now').onclick = () => start(scope, false);
+  if (scope) $('#up').onclick = () => go(parent);
 }
 
 async function start(scope, force) {
@@ -429,6 +450,7 @@ function showMap(map) {
   renderGraph();
   fit();
   renderPanel();
+  if (state.pendingSim) playPendingSim();
 }
 
 function renderGraph() {
@@ -482,9 +504,21 @@ function renderNodes() {
       <rect class="band" width="5" height="${p.h - 16}" x="0" y="8" rx="2"></rect>
       <text class="name" x="16" y="23">${esc(p.name)}</text>
       <text class="kind" x="16" y="41">${esc(node.kind)}</text>
-      ${drill ? `<text class="drill" x="${p.w - 12}" y="41" text-anchor="end">${node.explorable ? 'explore ›' : '›'}</text>` : ''}
+      ${drill ? `<text class="drill ${childState(node.id)}" x="${p.w - 12}" y="41" text-anchor="end">${drillLabel(node)}</text>` : ''}
     </g>`;
   }).join('');
+}
+
+/** `fresh` / `stale` when the node's inner map is cached, `none` otherwise. */
+function childState(id) {
+  return state.children?.[id] || 'none';
+}
+
+function drillLabel(node) {
+  const s = childState(node.id);
+  if (s === 'fresh') return 'open ›';
+  if (s === 'stale') return 'open (stale) ›';
+  return node.explorable ? 'explore ›' : '›';
 }
 
 function applyHighlight() {
@@ -689,6 +723,7 @@ function renderPanel() {
   if (subject !== state.panelSubject) $('#panel').scrollTop = 0;
   state.panelSubject = subject;
   if (state.tab === 'ask') renderAskContext();
+  if (state.flow !== null && !state.selected) fillTraceBox();
 }
 
 function renderPanelContent() {
@@ -744,20 +779,29 @@ function renderPanelContent() {
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>
-    <div class="actions"><button data-act="reexplore" type="button">Re-explore</button>
+    ${staleBanner()}
+    <div class="actions"><button data-act="reexplore" type="button">${state.freshness?.state === 'stale' ? 'Refresh' : 'Re-explore'}</button>
       ${state.customLayout ? '<button data-act="reset-layout" type="button" title="Discard dragged positions">Reset layout</button>' : ''}</div>
     <h3>Data flows</h3>
-    ${map.flows.length ? '<ul class="list">' + map.flows.map((f, i) => `<li class="click ${i === state.flow ? 'active' : ''}" data-flow="${i}">
+    ${map.flows.length ? `<div class="sim-controls">
+        <label>Inputs <input id="sim-n" type="number" min="1" max="20" value="${sim.n}"></label>
+        <label>Speed <select id="sim-speed">${[['0.5', 'slow'], ['1', 'normal'], ['2', 'fast']].map(([v, l]) => `<option value="${v}" ${String(sim.speed) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+        ${sim.running ? '<button type="button" data-sim-stop>■ Stop</button>' : ''}
+      </div>` : ''}
+    ${map.flows.length ? '<ul class="list">' + map.flows.map((f, i) => `<li class="click flow-item ${i === state.flow ? 'active' : ''}" data-flow="${i}">
+        <button type="button" class="play" data-sim="${i}" title="Simulate ${sim.n} inputs travelling this flow">▶</button>
         <b>${esc(f.name)}</b><div class="muted">${esc(f.description)}</div></li>`).join('') + '</ul>' : '<p class="muted">None identified.</p>'}
-    ${flow ? `<h3>Steps: ${esc(flow.name)}</h3><ul class="list">` + flow.steps.map((s, n) => {
+    ${flow ? `<h3>Steps: ${esc(flow.name)}</h3>${simStatus()}<ul class="list" id="flow-steps">` + flow.steps.map((s, n) => {
       let i = map.edges.findIndex((e) => e.from === s.from && e.to === s.to);
       if (i < 0) i = map.edges.findIndex((e) => e.from === s.to && e.to === s.from);
-      return `<li class="${i >= 0 ? 'click' : ''}" ${i >= 0 ? `data-sel-edge="${i}"` : ''}><div class="step"><span class="step-no">${n + 1}</span>
-        <span><b>${esc(nodeById(s.from)?.name)} → ${esc(nodeById(s.to)?.name)}</b><div class="muted">${esc(s.action)}</div></span></div></li>`;
-    }).join('') + '</ul>' : ''}
+      const inner = childState(s.to) !== 'none' && nodeById(s.to)?.paths.length;
+      return `<li class="${i >= 0 ? 'click' : ''}" data-step="${n}" ${i >= 0 ? `data-sel-edge="${i}"` : ''}><div class="step"><span class="step-no">${n + 1}</span>
+        <span><b>${esc(nodeById(s.from)?.name)} → ${esc(nodeById(s.to)?.name)}</b><div class="muted">${esc(s.action)}</div>
+        ${inner ? `<a class="path-link" data-follow="${esc(s.to)}" data-from="${esc(s.from)}">Follow inside ${esc(nodeById(s.to).name)} ›</a>` : ''}</span></div></li>`;
+    }).join('') + '</ul><h3>Example inputs</h3><div id="trace-box"></div>' : ''}
     <h3>Components</h3>
     <ul class="list">${map.nodes.map((n) => `<li class="click" data-sel-node="${esc(n.id)}"><span class="swatch" style="--kc:${kindColor(n.kind)}"></span><b>${esc(n.name)}</b>
-      <span class="muted"> ${esc(n.kind)}</span>${n.paths.length ? ` <a class="path-link" data-drill="${esc(n.id)}">explore ›</a>` : ''}</li>`).join('')}</ul>
+      <span class="muted"> ${esc(n.kind)}</span>${n.paths.length ? ` <a class="path-link drill-${childState(n.id)}" data-drill="${esc(n.id)}">${esc(drillLabel(n))}</a>` : ''}</li>`).join('')}</ul>
     ${map.diagnostics.length ? `<h3>Diagnostics</h3><details><summary>${map.diagnostics.length} issues in the agent's answer</summary>
       <ul>${map.diagnostics.map((d) => `<li class="meta">${esc(d)}</li>`).join('')}</ul></details>` : ''}
     <h3>How to read</h3>
@@ -770,13 +814,26 @@ function renderPanelContent() {
     </div>`;
 }
 
+function staleBanner() {
+  const f = state.freshness;
+  if (f?.state !== 'stale') return '';
+  const since = f.since ? ` since commit <code>${esc(f.since.slice(0, 10))}</code>` : '';
+  const files = f.changed.length
+    ? `<details><summary>${f.total} file${f.total === 1 ? '' : 's'} changed${since}</summary><ul class="changed">${f.changed.map((p) => `<li><a class="path-link" data-src="${esc(p)}">${esc(p)}</a></li>`).join('')}${f.total > f.changed.length ? `<li class="muted">… ${f.total - f.changed.length} more</li>` : ''}</ul></details>`
+    : `<p class="meta">The covered content changed${since}.</p>`;
+  return `<div class="stale"><b>Stale map.</b> It describes an earlier version of this code; Refresh re-explores it.${files}</div>`;
+}
+
 function legendLine(text, dash) {
   return `<span><svg width="34" height="8"><line x1="0" y1="4" x2="34" y2="4" stroke="var(--edge)" stroke-width="1.6" stroke-dasharray="${dash}"></line></svg>${esc(text)}</span>`;
 }
 
 $('#panel').addEventListener('click', (e) => {
-  const t = e.target.closest('[data-src], [data-drill], [data-sel-node], [data-sel-edge], [data-flow], [data-act]');
+  const t = e.target.closest('[data-sim], [data-sim-stop], [data-follow], [data-src], [data-drill], [data-sel-node], [data-sel-edge], [data-flow], [data-act]');
   if (!t) return;
+  if (t.dataset.sim !== undefined) return startFlowSim(Number(t.dataset.sim));
+  if (t.dataset.simStop !== undefined) return stopSim(true);
+  if (t.dataset.follow !== undefined) return followInside(t.dataset.follow, t.dataset.from);
   if (t.dataset.src !== undefined) return openSource(t.dataset.src, Number(t.dataset.line) || 0);
   if (t.dataset.drill !== undefined) return go(childScope(t.dataset.drill));
   if (t.dataset.selNode !== undefined) { state.flow = null; state.selected = { type: 'node', id: t.dataset.selNode }; }
@@ -796,6 +853,325 @@ $('#panel').addEventListener('click', (e) => {
   }
   applyHighlight();
   renderPanel();
+});
+
+// ---------- simulation ----------
+
+const SIM_PX_PER_MS = 0.32; // token speed at "normal"
+const SIM_MIN_STEP_MS = 450;
+const SIM_PAUSE_MS = 260; // dwell at each box between steps
+
+/** Running animation of tokens along step paths; each token carries its own steps. */
+const sim = { n: 5, speed: 1, running: false, raf: 0, tokens: [], label: '', done: 0, followable: [] };
+
+$('#panel').addEventListener('change', (e) => {
+  if (e.target.id === 'sim-n') sim.n = Math.max(1, Math.min(20, Number(e.target.value) || 1));
+  if (e.target.id === 'sim-speed') sim.speed = Number(e.target.value) || 1;
+});
+
+function simStatus() {
+  if (!sim.running && !sim.tokens.length) return '';
+  return `<p class="meta" id="sim-status">${esc(simStatusText())}</p>`;
+}
+
+function simStatusText() {
+  const total = sim.tokens.length;
+  return sim.running ? `Simulating ${total} input${total === 1 ? '' : 's'}: ${sim.done}/${total} reached the end` : `${sim.done}/${total} inputs reached the end`;
+}
+
+/** Geometry of one hop: the drawn edge (either direction) or a guide curve. */
+function hopGeometry(step) {
+  const map = state.map;
+  let i = map.edges.findIndex((e) => e.from === step.from && e.to === step.to);
+  let reverse = false;
+  if (i < 0) {
+    i = map.edges.findIndex((e) => e.from === step.to && e.to === step.from);
+    reverse = i >= 0;
+  }
+  const d = i >= 0 ? state.edgeGeom[i].d : edgePath(state.layout, step, 0).d;
+  return { d, reverse };
+}
+
+function stopSim(keepStatus = false) {
+  cancelAnimationFrame(sim.raf);
+  sim.running = false;
+  $('#sim').innerHTML = '';
+  document.querySelectorAll('#nodes .node.sim-hit').forEach((el) => el.classList.remove('sim-hit'));
+  if (!keepStatus) sim.tokens = [];
+  const status = $('#sim-status');
+  if (status) status.textContent = simStatusText();
+}
+
+/**
+ * Animate tokens. `routes` holds one step list per token; tokens start staggered
+ * and move at constant speed, pausing at each box.
+ */
+function runSim(routes, { colors = [], labels = [], onStep } = {}) {
+  stopSim();
+  const layer = $('#sim');
+  const measure = (d) => {
+    const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    p.setAttribute('d', d);
+    p.setAttribute('class', 'sim-track');
+    layer.appendChild(p);
+    return p;
+  };
+  const stagger = 650 / sim.speed;
+  sim.tokens = routes.map((steps, k) => {
+    const hops = steps.filter((s) => state.layout.at[s.from] && state.layout.at[s.to] && s.from !== s.to).map((s) => {
+      const { d, reverse } = hopGeometry(s);
+      const path = measure(d);
+      const len = path.getTotalLength();
+      return { step: s, path, len, reverse, ms: Math.max(SIM_MIN_STEP_MS, len / SIM_PX_PER_MS) / sim.speed };
+    });
+    const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    g.setAttribute('class', 'sim-token');
+    if (colors[k]) g.style.setProperty('--tc', colors[k]);
+    g.innerHTML = `<circle r="7"></circle><text text-anchor="middle" y="3.5">${esc(labels[k] ?? k + 1)}</text>`;
+    layer.appendChild(g);
+    return { hops, g, start: k * stagger, hop: -1, finished: false };
+  });
+  sim.done = 0;
+  sim.running = true;
+  const t0 = performance.now();
+  const pulse = (id) => {
+    const el = document.querySelector(`#nodes [data-node="${CSS.escape(id)}"]`);
+    if (!el) return;
+    el.classList.remove('sim-hit');
+    void el.getBoundingClientRect(); // restart the CSS animation
+    el.classList.add('sim-hit');
+  };
+  const frame = (now) => {
+    const t = now - t0;
+    let active = 0;
+    for (const [k, tok] of sim.tokens.entries()) {
+      if (tok.finished) continue;
+      let local = t - tok.start;
+      if (local < 0 || !tok.hops.length) {
+        tok.g.style.opacity = '0';
+        if (!tok.hops.length && local >= 0) { tok.finished = true; sim.done++; }
+        active++;
+        continue;
+      }
+      tok.g.style.opacity = '1';
+      let h = 0;
+      while (h < tok.hops.length && local > tok.hops[h].ms + SIM_PAUSE_MS) {
+        local -= tok.hops[h].ms + SIM_PAUSE_MS;
+        h++;
+      }
+      if (h >= tok.hops.length) {
+        tok.finished = true;
+        sim.done++;
+        tok.g.style.opacity = '0';
+        pulse(tok.hops[tok.hops.length - 1].step.to);
+        continue;
+      }
+      active++;
+      const hop = tok.hops[h];
+      if (h !== tok.hop) {
+        tok.hop = h;
+        pulse(hop.step.from);
+        onStep?.(k, h, hop.step);
+      }
+      const p = Math.min(1, local / hop.ms);
+      const pt = hop.path.getPointAtLength((hop.reverse ? 1 - p : p) * hop.len);
+      // Counter-scale so tokens stay readable at any zoom.
+      tok.g.setAttribute('transform', `translate(${pt.x},${pt.y}) scale(${1 / Math.max(state.view.k, 0.05)})`);
+    }
+    const status = $('#sim-status');
+    if (status) status.textContent = simStatusText();
+    if (active) sim.raf = requestAnimationFrame(frame);
+    else {
+      sim.running = false;
+      if (status) status.textContent = simStatusText();
+      if (!state.selected) renderPanel();
+    }
+  };
+  sim.raf = requestAnimationFrame(frame);
+}
+
+/** Simulate N identical inputs travelling one flow of the current map. */
+function startFlowSim(index, { n = sim.n } = {}) {
+  const flow = state.map.flows[index];
+  if (!flow) return;
+  state.selected = null;
+  state.flow = index;
+  applyHighlight();
+  sim.tokens = [{}]; // makes the status line render before the run starts
+  renderPanel();
+  runSim(Array.from({ length: n }, () => flow.steps), {
+    onStep: (k, h) => {
+      if (k !== 0) return; // the lead token marks the current step
+      document.querySelectorAll('#flow-steps li').forEach((li) => li.classList.toggle('sim-active', Number(li.dataset.step) === h));
+    },
+  });
+}
+
+/** Lowercase word set for loose name matching across levels. */
+function words(text) {
+  return new Set(String(text).toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2));
+}
+
+/**
+ * Continue a simulation one level down: open the component's map and play the flow
+ * whose steps involve the neighbour the input came from (by name).
+ */
+function followInside(nodeId, fromId) {
+  const from = nodeById(fromId)?.name || '';
+  state.pendingSim = { from, n: sim.n };
+  go(childScope(nodeId));
+}
+
+function playPendingSim() {
+  const pending = state.pendingSim;
+  state.pendingSim = null;
+  if (!pending || !state.map?.flows.length) return;
+  const want = words(pending.from);
+  let best = 0;
+  let bestScore = -1;
+  state.map.flows.forEach((f, i) => {
+    const names = f.steps.flatMap((s) => [nodeById(s.from)?.name, nodeById(s.to)?.name, s.action]).join(' ');
+    const have = words(`${f.name} ${f.description} ${names}`);
+    const score = [...want].filter((w) => have.has(w)).length;
+    if (score > bestScore) { best = i; bestScore = score; }
+  });
+  startFlowSim(best, { n: pending.n });
+}
+
+// ---------- example inputs (traces) ----------
+
+const SCENARIO_COLORS = ['#2f6fe4', '#e8590c', '#2b8a3e', '#ae3ec9', '#c92a2a', '#1098ad', '#f08c00', '#5c7cfa'];
+const traceState = new Map(); // `${scope}#${flow}` -> { status, traces, job, last, error }
+
+function traceId(flow = state.flow) {
+  return `${state.scope}#${flow}`;
+}
+
+async function fillTraceBox() {
+  const box = $('#trace-box');
+  if (!box) return;
+  const id = traceId();
+  let t = traceState.get(id);
+  if (!t) {
+    t = { status: 'loading' };
+    traceState.set(id, t);
+    try {
+      const res = await api(`/api/trace?scope=${encodeURIComponent(state.scope)}&flow=${state.flow}`);
+      Object.assign(t, res.status === 'ready' ? { status: 'ready', traces: res.traces } : { status: res.status, job: res.job });
+      if (res.status === 'running') pollTrace(id, t);
+    } catch (err) {
+      Object.assign(t, { status: 'failed', error: err.message });
+    }
+  }
+  if (traceId() === id) renderTraceBox(t);
+}
+
+function renderTraceBox(t) {
+  const box = $('#trace-box');
+  if (!box) return;
+  if (t.status === 'loading') { box.innerHTML = '<p class="muted">Loading…</p>'; return; }
+  if (t.status === 'missing' || t.status === 'failed' || t.status === 'cancelled') {
+    box.innerHTML = `${t.error ? `<p class="error-text">${esc(t.error)}</p>` : ''}
+      <p class="meta">Concrete inputs that take different branches through this flow, with the data at every hop and the code that decides it.</p>
+      <div class="actions"><button type="button" data-trace-gen>Generate example inputs</button></div>
+      <p class="meta">Runs Codex in a read-only sandbox (about 1–3 minutes); the result is cached with the map.</p>`;
+    return;
+  }
+  if (t.status === 'running') {
+    box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>Codex is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
+      <button type="button" data-trace-cancel>Cancel</button></div>${t.last ? `<div class="last">${esc(t.last)}</div>` : ''}</div>`;
+    return;
+  }
+  const { scenarios, meta, diagnostics } = t.traces;
+  if (!scenarios.length) {
+    box.innerHTML = '<p class="muted">Codex returned no scenario on this map.</p><div class="actions"><button type="button" data-trace-gen>Try again</button></div>';
+    return;
+  }
+  box.innerHTML = `<div class="actions" style="margin-top:0"><button type="button" class="primary" data-trace-play>▶ Play ${scenarios.length} examples</button>
+      <button type="button" data-trace-gen title="Generate new examples">Regenerate</button></div>
+    <ul class="list scenarios">${scenarios.map((sc, k) => `<li class="scenario" data-scenario="${k}" style="--tc:${SCENARIO_COLORS[k % SCENARIO_COLORS.length]}">
+      <div class="sc-head"><span class="sc-dot">${String.fromCharCode(65 + k)}</span><b>${esc(sc.name)}</b>
+        <button type="button" class="play" data-trace-play="${k}" title="Play this example">▶</button></div>
+      <div class="sc-io"><span class="muted">in</span> <code>${esc(trunc(sc.input, 160))}</code></div>
+      <div class="sc-io"><span class="muted">out</span> ${esc(sc.outcome)}</div>
+      <div class="sc-now" id="sc-now-${k}"></div>
+      <details><summary>${sc.steps.length} hops</summary><ol class="sc-steps">${sc.steps.map((s) => `<li>
+        <b>${esc(nodeById(s.from)?.name || s.from)} → ${esc(nodeById(s.to)?.name || s.to)}</b><div class="muted">${esc(s.action)}</div>
+        ${s.payload ? `<pre class="payload">${esc(s.payload)}</pre>` : ''}${s.evidence.length ? evidenceList(s.evidence) : ''}</li>`).join('')}</ol></details>
+    </li>`).join('')}</ul>
+    ${diagnostics?.length ? `<details><summary class="meta">${diagnostics.length} hops not on the map were dropped</summary><ul>${diagnostics.map((d) => `<li class="meta">${esc(d)}</li>`).join('')}</ul></details>` : ''}
+    ${meta ? `<p class="meta">${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in / ${fmtTokens(meta.output_tokens)} out tokens</p>` : ''}`;
+}
+
+function pollTrace(id, t) {
+  let since = 0;
+  const tick = async () => {
+    let job;
+    try {
+      job = await api(`/api/job/${t.job}?since=${since}`);
+    } catch (err) {
+      Object.assign(t, { status: 'failed', error: err.message });
+      if (traceId() === id) renderTraceBox(t);
+      return;
+    }
+    since = job.next;
+    const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
+    if (lines.length) t.last = lines[lines.length - 1];
+    t.elapsed = job.elapsed_ms;
+    if (job.status === 'running') setTimeout(tick, 1000);
+    else if (job.status === 'done') Object.assign(t, { status: 'ready', traces: job.result });
+    else Object.assign(t, { status: job.status, error: job.status === 'cancelled' ? '' : job.error });
+    if (traceId() === id) renderTraceBox(t);
+  };
+  tick();
+}
+
+async function generateTrace() {
+  const id = traceId();
+  const t = { status: 'running', elapsed: 0 };
+  traceState.set(id, t);
+  renderTraceBox(t);
+  try {
+    const res = await post('/api/trace', { scope: state.scope, flow: state.flow });
+    t.job = res.job;
+    pollTrace(id, t);
+  } catch (err) {
+    Object.assign(t, { status: 'failed', error: err.message });
+    renderTraceBox(t);
+  }
+}
+
+/** Play scenarios: one token per scenario on its own route, showing its data at each hop. */
+function playScenarios(only) {
+  const t = traceState.get(traceId());
+  if (t?.status !== 'ready') return;
+  const all = t.traces.scenarios.map((sc, k) => ({ sc, k }));
+  const picked = only === undefined ? all : all.filter(({ k }) => k === only);
+  document.querySelectorAll('.sc-now').forEach((el) => { el.textContent = ''; });
+  runSim(picked.map(({ sc }) => sc.steps), {
+    colors: picked.map(({ k }) => SCENARIO_COLORS[k % SCENARIO_COLORS.length]),
+    labels: picked.map(({ k }) => String.fromCharCode(65 + k)),
+    onStep: (i, h, step) => {
+      const el = $(`#sc-now-${picked[i].k}`);
+      if (el) el.innerHTML = `<span class="muted">now</span> ${esc(nodeById(step.from)?.name || step.from)} → ${esc(nodeById(step.to)?.name || step.to)}${step.payload ? `<pre class="payload">${esc(step.payload)}</pre>` : ''}`;
+    },
+  });
+}
+
+$('#panel').addEventListener('click', (e) => {
+  if (e.target.closest('[data-trace-gen]')) return generateTrace();
+  const cancel = e.target.closest('[data-trace-cancel]');
+  if (cancel) {
+    const t = traceState.get(traceId());
+    cancel.disabled = true;
+    if (t?.job) post(`/api/job/${t.job}/cancel`).catch(() => {});
+    return;
+  }
+  const play = e.target.closest('[data-trace-play]');
+  if (play) {
+    e.stopPropagation();
+    playScenarios(play.dataset.tracePlay === '' ? undefined : Number(play.dataset.tracePlay));
+  }
 });
 
 // ---------- highlighting ----------
