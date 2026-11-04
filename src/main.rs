@@ -12,6 +12,7 @@ mod search;
 mod server;
 mod skill;
 mod trace;
+mod update;
 mod verify;
 
 use clap::Parser;
@@ -79,6 +80,12 @@ struct Args {
     /// it points Codex sessions at `.cxplr/atlas` in repositories that have one
     #[arg(long)]
     install_skill: bool,
+    /// Update cxplr now (`cargo install --git` of the latest main) and exit
+    #[arg(long)]
+    update: bool,
+    /// Skip the automatic update check (also: CXPLR_NO_UPDATE=1)
+    #[arg(long)]
+    no_update: bool,
 }
 
 /// Index depth: a level count, or `None` for the full hierarchy.
@@ -132,10 +139,28 @@ async fn rebuild_atlas(ex: &Arc<explore::Explorer>) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.update {
+        update::update_now()?;
+        if let Some(path) = skill::refresh_if_installed() {
+            println!("updated the cxplr skill at {}", path.display());
+        }
+        return Ok(());
+    }
     if args.install_skill {
         let path = skill::install()?;
         println!("installed the cxplr skill at {}", path.display());
         return Ok(());
+    }
+    if let Some(path) = skill::refresh_if_installed() {
+        println!("updated the cxplr skill at {}", path.display());
+    }
+    if !args.no_update {
+        // Network check off the startup path; the build itself runs detached.
+        std::thread::spawn(|| {
+            if let Some(message) = update::check_in_background() {
+                println!("{message}");
+            }
+        });
     }
     let repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));

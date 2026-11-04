@@ -32,16 +32,27 @@ When the task needs an understanding of how the code is organised:
    with `cxplr <repository> --index`.
 "#;
 
-/// Write the skill to `$CODEX_HOME/skills/cxplr/SKILL.md` (default `~/.codex`).
-pub fn install() -> io::Result<PathBuf> {
+fn skill_path() -> io::Result<PathBuf> {
     let home = env::var_os("CODEX_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "neither CODEX_HOME nor HOME is set"))?;
-    let dir = home.join("skills").join("cxplr");
-    fs::create_dir_all(&dir)?;
-    let path = dir.join("SKILL.md");
+    Ok(home.join("skills").join("cxplr").join("SKILL.md"))
+}
+
+/// Write the skill to `$CODEX_HOME/skills/cxplr/SKILL.md` (default `~/.codex`).
+pub fn install() -> io::Result<PathBuf> {
+    let path = skill_path()?;
+    fs::create_dir_all(path.parent().expect("skill path has a parent"))?;
     fs::write(&path, SKILL)?;
     Ok(path)
+}
+
+/// Keep an installed skill in step with this version of cxplr (e.g. after an update).
+/// Returns the path when it was rewritten.
+pub fn refresh_if_installed() -> Option<PathBuf> {
+    let path = skill_path().ok()?;
+    let current = fs::read_to_string(&path).ok()?;
+    (current != SKILL).then(|| fs::write(&path, SKILL).ok().map(|()| path)).flatten()
 }
