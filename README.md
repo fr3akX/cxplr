@@ -23,7 +23,7 @@ map (see [Codex sessions](#codex-sessions)).
 
 ## Requirements
 
-- Rust toolchain (`cargo`), to install and update.
+- Linux or macOS (x86_64 or arm64).
 - `codex` on `PATH`, logged in, with `codex app-server` (experimental in Codex 0.166;
   cxplr stops with a clear error if it is missing). Model and reasoning effort come from
   your Codex config unless `--model` is given.
@@ -32,26 +32,44 @@ map (see [Codex sessions](#codex-sessions)).
 ## Install
 
 ```sh
-cargo install --git https://github.com/fr3akX/cxplr --locked
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fr3akX/cxplr/releases/latest/download/cxplr-installer.sh | sh
 ```
 
-This builds the latest `main` and puts `cxplr` in `~/.cargo/bin` (make sure it is on
-your `PATH`). To pin a version, add `--rev <commit>`; to build from a checkout, run
-`cargo install --path . --locked` in it.
+The installer downloads the prebuilt binary for your platform from the latest
+[GitHub release](https://github.com/fr3akX/cxplr/releases), checks its checksum and
+puts `cxplr` in `~/.cargo/bin` (it offers to add that to your `PATH`).
+
+From source, with a Rust toolchain: `cargo install --git https://github.com/fr3akX/cxplr --locked`
+(or `cargo install --path . --locked` in a checkout).
 
 ### Updates
 
-A cxplr installed with `cargo install --git` keeps itself up to date. At most every
-6 hours it compares the commit it was built from with GitHub's `main`
-(`git ls-remote`, off the startup path); when `main` has moved on, it runs the same
-`cargo install` in the background (log: `~/.cache/cxplr/update.log`) and the new
-version is used from the next start. The running instance is not affected, and an
-installed Codex skill is refreshed on the first start of the new version.
+At most every 6 hours, a cxplr installed by the installer checks GitHub Releases in the
+background and prints a one-line notice when a newer version exists:
 
-- `cxplr --update` updates now, in the foreground.
-- `--no-update`, or `CXPLR_NO_UPDATE=1`, skips the check.
-- Builds that cargo did not install from this repository (e.g. `cargo build` in a
-  checkout, or `cargo install --path`) never update themselves.
+```
+cxplr 0.3.0 is available (you have 0.2.0): run `cxplr --update`
+```
+
+`cxplr --update` downloads and installs it with the same installer; an installed Codex
+skill is refreshed on the first start of the new version. `--no-update`, or
+`CXPLR_NO_UPDATE=1`, skips the check. Builds from source are not checked; update them
+by re-running `cargo install`.
+
+### Releasing
+
+Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/cargo-dist)
+(`.github/workflows/release.yml`, configured in `dist-workspace.toml`). To publish:
+
+```sh
+# bump `version` in Cargo.toml, then:
+cargo build && git commit -am "Release 0.3.0"
+git tag v0.3.0 && git push && git push --tags
+```
+
+The tag triggers builds for the four targets and a GitHub release with the archives,
+checksums and `cxplr-installer.sh`. After changing `dist-workspace.toml`, run
+`dist generate` to update the workflow.
 
 ## Quick start
 
@@ -321,5 +339,5 @@ cxplr [REPO] [OPTIONS]
 | `--no-lsp` | | Disable language servers; navigation uses text search |
 | `--forget-sessions` | | Delete the Codex sessions cxplr created for `REPO` and exit |
 | `--install-skill` | | Install the cxplr skill for Codex and exit |
-| `--update` | | Update to the latest `main` now (`cargo install --git`) and exit |
-| `--no-update` | | Skip the automatic update check (also `CXPLR_NO_UPDATE=1`) |
+| `--update` | | Install the latest release now (installer installs) and exit |
+| `--no-update` | | Skip the check for a newer release (also `CXPLR_NO_UPDATE=1`) |

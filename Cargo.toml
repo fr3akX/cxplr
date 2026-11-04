@@ -1,10 +1,12 @@
 [package]
 name = "cxplr"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "cxplr (Code Explore): learn a repository's architecture top-down, then drill in"
+repository = "https://github.com/fr3akX/cxplr"
 
 [dependencies]
+axoupdater = "0.10.3"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 ignore = "0.4"
@@ -13,3 +15,8 @@ serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "signal", "net"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

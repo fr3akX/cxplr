@@ -80,10 +80,10 @@ struct Args {
     /// it points Codex sessions at `.cxplr/atlas` in repositories that have one
     #[arg(long)]
     install_skill: bool,
-    /// Update cxplr now (`cargo install --git` of the latest main) and exit
+    /// Install the latest release now (for installs made with the release installer) and exit
     #[arg(long)]
     update: bool,
-    /// Skip the automatic update check (also: CXPLR_NO_UPDATE=1)
+    /// Skip the check for a newer release (also: CXPLR_NO_UPDATE=1)
     #[arg(long)]
     no_update: bool,
 }
@@ -140,10 +140,8 @@ async fn rebuild_atlas(ex: &Arc<explore::Explorer>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if args.update {
-        update::update_now()?;
-        if let Some(path) = skill::refresh_if_installed() {
-            println!("updated the cxplr skill at {}", path.display());
-        }
+        // The new binary refreshes an installed skill on its first start.
+        println!("{}", update::update_now().await?);
         return Ok(());
     }
     if args.install_skill {
@@ -155,9 +153,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("updated the cxplr skill at {}", path.display());
     }
     if !args.no_update {
-        // Network check off the startup path; the build itself runs detached.
-        std::thread::spawn(|| {
-            if let Some(message) = update::check_in_background() {
+        // Off the startup path; prints a one-line notice when a newer release exists.
+        tokio::spawn(async {
+            if let Some(message) = update::notice().await {
                 println!("{message}");
             }
         });
