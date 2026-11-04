@@ -1,4 +1,4 @@
-# code-explore
+# cxplr — Code Explore
 
 Learn an unfamiliar repository top-down. Point it at a project and get a local web
 map of its components, how they interact and the main data flows. Then drill into any
@@ -11,7 +11,7 @@ component for the next level of detail, down to the cited source lines.
 | Source | The exact file and line behind every claim, plus directory browsing |
 
 The exploration is done by [Codex](https://github.com/openai/codex) (`codex exec`)
-running in a read-only sandbox inside the target repository. code-explore builds the
+running in a read-only sandbox inside the target repository. cxplr builds the
 prompt for each zoom level, constrains the answer to a JSON schema, checks every
 citation against the files on disk, caches the result and serves the UI.
 
@@ -25,8 +25,8 @@ citation against the files on disk, caches the result and serves the UI.
 
 ```sh
 cargo build --release
-./target/release/code-explore /path/to/repo --index   # map the project, then open the browser
-./target/release/code-explore /path/to/repo           # browse what is cached: http://127.0.0.1:7878
+./target/release/cxplr /path/to/repo --index   # map the project, then open the browser
+./target/release/cxplr /path/to/repo           # browse what is cached: http://127.0.0.1:7878
 ```
 
 `--index` explores the system map and then every component worth a deeper map,
@@ -100,7 +100,7 @@ with the repository as workspace:
 Override or add one with `--lsp`, e.g. pyright without a global install:
 
 ```sh
-code-explore /path/to/repo --lsp "python=npx -y -p pyright@1 pyright-langserver --stdio"
+cxplr /path/to/repo --lsp "python=npx -y -p pyright@1 pyright-langserver --stdio"
 ```
 
 `--lsp python=` disables a language. Language servers can run project tooling
@@ -132,7 +132,7 @@ in the page and is lost on reload.
 
 ## Cache
 
-Everything is cached in `.code-xplr/` inside the explored directory (it contains its
+Everything is cached in `.cxplr/` inside the explored directory (it contains its
 own `.gitignore`, so git ignores it; `--cache-dir` puts it elsewhere, e.g. for
 read-only checkouts).
 
@@ -147,4 +147,4 @@ the working tree), the prompt version and the model. So:
 - going back to earlier content (e.g. checking out an older branch) finds that
   content's map again.
 
-Example inputs are cached per map content and flow. Delete `.code-xplr/` to start over.
+Example inputs are cached per map content and flow. Delete `.cxplr/` to start over.

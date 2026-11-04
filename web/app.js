@@ -130,7 +130,7 @@ function showMissing(scope) {
   showScreen(`
     <h2>${scope ? 'This component has no map yet' : 'This project has no map yet'}</h2>
     <p class="muted">Exploring runs Codex in a read-only sandbox, typically a few minutes.
-      To map the whole project up front, run <code>code-explore ${esc(state.repo?.root || '.')} --index</code>.</p>
+      To map the whole project up front, run <code>cxplr ${esc(state.repo?.root || '.')} --index</code>.</p>
     <div class="row">
       <button class="primary" id="explore-now" type="button">Explore now</button>
       ${scope ? '<button id="up" type="button">Back up one level</button>' : ''}
@@ -393,7 +393,7 @@ function edgePath(L, e, offset) {
 // ---------- graph rendering ----------
 
 function layoutKey() {
-  return `code-explore:layout:${state.repo?.root}@${state.repo?.commit || 'no-commit'}:${state.scope}`;
+  return `cxplr:layout:${state.repo?.root}@${state.repo?.commit || 'no-commit'}:${state.scope}`;
 }
 
 /** Positions the user dragged, keyed by node id (box centres). */

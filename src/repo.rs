@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Project-local cache directory; never part of a map's content.
-pub const CACHE_DIR_NAME: &str = ".code-xplr";
+pub const CACHE_DIR_NAME: &str = ".cxplr";
 const MAX_CHANGED: usize = 50;
 
 /// Repository-relative file path → git blob hash of its current working-tree content.
@@ -169,7 +169,7 @@ mod tests {
 
     impl TempGit {
         fn new(tag: &str) -> TempGit {
-            let dir = std::env::temp_dir().join(format!("code-explore-repo-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("cxplr-repo-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("a")).unwrap();
             fs::create_dir_all(dir.join("b")).unwrap();

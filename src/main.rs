@@ -39,7 +39,7 @@ struct Args {
     /// Time limit for one exploration or question, in minutes
     #[arg(long, default_value_t = 20)]
     timeout_mins: u64,
-    /// Cache directory (default: `.code-xplr` in the explored directory)
+    /// Cache directory (default: `.cxplr` in the explored directory)
     #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// Index the project before serving: explore the system map and every
@@ -113,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ex = Arc::new(explore::Explorer { repo, cache, agent, map_schema });
 
     let commit = ex.repo.head().map_or("no git commit".to_owned(), |c| c[..c.len().min(12)].to_owned());
-    println!("code-explore: {} ({commit}), cache {}", ex.repo.root.display(), cache_dir.display());
+    println!("cxplr: {} ({commit}), cache {}", ex.repo.root.display(), cache_dir.display());
 
     if args.index || args.index_only {
         let opts = index::Options { depth: args.depth.into(), jobs: args.jobs.into(), min_lines: args.min_lines };

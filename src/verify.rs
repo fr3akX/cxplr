@@ -114,7 +114,7 @@ mod tests {
 
     impl TempRepo {
         fn new(tag: &str) -> TempRepo {
-            let dir = std::env::temp_dir().join(format!("code-explore-test-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("cxplr-test-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("src")).unwrap();
             fs::write(dir.join("src/main.rs"), "fn main() {\n    run();\n}").unwrap();

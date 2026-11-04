@@ -36,7 +36,7 @@ files, modules or classes); false for small single files, external systems and a
 - When something is inferred rather than seen in code or config, write \"(inferred)\" in \
 the summary or label.
 - Ignore vendored, generated and build output (node_modules, target, dist, build, .git, \
-.code-xplr, lock files).
+.cxplr, lock files).
 ";
 
 pub fn system(repo_name: &str) -> String {

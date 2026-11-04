@@ -1,8 +1,8 @@
 [package]
-name = "code-explore"
+name = "cxplr"
 version = "0.1.0"
 edition = "2021"
-description = "Explore a repository's architecture top-down: components, interactions and data flows, then drill in"
+description = "cxplr (Code Explore): learn a repository's architecture top-down, then drill in"
 
 [dependencies]
 axum = "0.8"

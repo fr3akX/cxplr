@@ -1,4 +1,4 @@
-//! Project-local, content-addressed cache in `<repo>/.code-xplr/` (it ignores itself
+//! Project-local, content-addressed cache in `<repo>/.cxplr/` (it ignores itself
 //! in git).
 //!
 //! - `maps/<key>.json`: one map. The key covers the cache format, prompt version,
@@ -20,7 +20,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const FORMAT: &str = "code-xplr/2";
+const FORMAT: &str = "cxplr/2";
 
 #[derive(Serialize, Deserialize)]
 struct Binding {
@@ -66,7 +66,7 @@ impl Cache {
         fs::create_dir_all(dir.join("traces"))?;
         let ignore = dir.join(".gitignore");
         if !ignore.exists() {
-            fs::write(ignore, "# code-explore cache: local only\n*\n")?;
+            fs::write(ignore, "# cxplr cache: local only\n*\n")?;
         }
         let salt = format!("{FORMAT}|prompt {}|model {}", prompt::VERSION, model.unwrap_or("default"));
         Ok(Cache { dir, salt })
@@ -159,15 +159,15 @@ mod tests {
 
     #[test]
     fn maps_stay_fresh_until_their_own_content_changes_then_serve_stale() {
-        let dir = std::env::temp_dir().join(format!("code-explore-cache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cxplr-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("a")).unwrap();
         fs::create_dir_all(dir.join("b")).unwrap();
         fs::write(dir.join("a/x.txt"), "one\n").unwrap();
         fs::write(dir.join("b/y.txt"), "two\n").unwrap();
         let repo = Repo::open(&dir).unwrap();
-        let cache = Cache::open(dir.join(".code-xplr"), None).unwrap();
-        assert_eq!(fs::read_to_string(dir.join(".code-xplr/.gitignore")).unwrap().lines().last(), Some("*"));
+        let cache = Cache::open(dir.join(".cxplr"), None).unwrap();
+        assert_eq!(fs::read_to_string(dir.join(".cxplr/.gitignore")).unwrap().lines().last(), Some("*"));
 
         let a = vec!["a".to_owned()];
         let b = vec!["b".to_owned()];
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(cache.state(&repo, "b"), Some("fresh"));
 
         // The same scope at a different model is a different key.
-        let other = Cache::open(dir.join(".code-xplr"), Some("another-model")).unwrap();
+        let other = Cache::open(dir.join(".cxplr"), Some("another-model")).unwrap();
         assert_eq!(other.state(&repo, "a"), Some("stale"));
         let _ = fs::remove_dir_all(&dir);
     }
