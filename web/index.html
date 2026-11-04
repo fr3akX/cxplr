@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Code Explorer</title>
+  <link rel="stylesheet" href="/vendor/highlight.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -34,17 +35,42 @@
       </svg>
       <div id="screen" hidden></div>
     </section>
-    <aside id="panel"></aside>
+    <aside id="side">
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" data-tab="details" class="active">Details</button>
+        <button type="button" role="tab" data-tab="ask">Ask <span id="ask-busy" class="busy-dot" hidden></span></button>
+      </div>
+      <div id="panel"></div>
+      <div id="ask" hidden>
+        <div id="chat"></div>
+        <div class="composer">
+          <div id="ask-context" class="chips"></div>
+          <textarea id="question" rows="3" placeholder="Ask about the code… (Ctrl+Enter to send)"></textarea>
+          <div class="composer-row">
+            <span class="muted small">Answered by Codex in a read-only sandbox; citations are checked against the files.</span>
+            <button id="ask-send" class="primary" type="button">Ask</button>
+          </div>
+        </div>
+      </div>
+    </aside>
   </main>
   <div id="modal" hidden>
     <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="src-path">
       <div class="modal-head">
+        <button id="src-back" type="button" title="Back (Alt+←)" disabled>‹</button>
+        <button id="src-fwd" type="button" title="Forward (Alt+→)" disabled>›</button>
         <span id="src-path"></span>
+        <span id="src-lsp" class="lsp-chip" hidden></span>
+        <button id="src-ask" type="button" title="Ask about the selected lines (or the whole file)">Ask about selection</button>
         <button id="src-close" type="button" title="Close (Esc)">Close</button>
       </div>
-      <div id="src-body"></div>
+      <div class="modal-main">
+        <div id="src-body"></div>
+        <div id="sym" hidden></div>
+      </div>
     </div>
   </div>
+  <script src="/vendor/highlight.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

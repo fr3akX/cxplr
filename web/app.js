@@ -688,6 +688,7 @@ function renderPanel() {
   renderPanelContent();
   if (subject !== state.panelSubject) $('#panel').scrollTop = 0;
   state.panelSubject = subject;
+  if (state.tab === 'ask') renderAskContext();
 }
 
 function renderPanelContent() {
@@ -701,7 +702,10 @@ function renderPanelContent() {
       <h2>${esc(node.name)}</h2>
       <span class="kind-chip" style="--kc:${kindColor(node.kind)}">${esc(node.kind)}</span>
       ${md(node.summary)}
-      ${node.paths.length ? `<div class="actions"><button class="primary" data-act="drill" type="button">Explore inside ›</button></div>` : ''}
+      <div class="actions">
+        ${node.paths.length ? '<button class="primary" data-act="drill" type="button">Explore inside ›</button>' : ''}
+        <button data-act="ask" type="button">Ask about this</button>
+      </div>
       <h3>Paths</h3>
       ${node.paths.length ? '<ul class="list">' + node.paths.map((p) => `<li><span class="path-link" data-src="${esc(p)}">${esc(p)}</span></li>`).join('') + '</ul>' : '<p class="muted">Not implemented in this repository.</p>'}
       <h3>Interactions (${rel.length})</h3>
@@ -780,6 +784,7 @@ $('#panel').addEventListener('click', (e) => {
   else if (t.dataset.flow !== undefined) { const i = Number(t.dataset.flow); state.selected = null; state.flow = state.flow === i ? null : i; }
   else if (t.dataset.act === 'back') state.selected = null;
   else if (t.dataset.act === 'drill') return go(childScope(state.selected.id));
+  else if (t.dataset.act === 'ask') return switchTab('ask');
   else if (t.dataset.act === 'reexplore') {
     localStorage.removeItem(layoutKey()); // node ids may mean something else in the new map
     return start(state.scope, true);
@@ -793,14 +798,177 @@ $('#panel').addEventListener('click', (e) => {
   renderPanel();
 });
 
-// ---------- source viewer (L3) ----------
+// ---------- highlighting ----------
 
-async function openSource(path, line) {
+const HL_BY_EXT = {
+  rs: 'rust', py: 'python', pyi: 'python', js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript', mts: 'typescript', cts: 'typescript', go: 'go', java: 'java', kt: 'kotlin',
+  swift: 'swift', c: 'c', h: 'c', cc: 'cpp', cpp: 'cpp', cxx: 'cpp', hpp: 'cpp', hh: 'cpp', cs: 'csharp', rb: 'ruby',
+  php: 'php', pl: 'perl', lua: 'lua', r: 'r', sh: 'bash', bash: 'bash', zsh: 'bash', ps1: 'powershell',
+  psm1: 'powershell', psd1: 'powershell', psrc: 'powershell', yaml: 'yaml', yml: 'yaml', json: 'json', jsonl: 'json',
+  toml: 'ini', ini: 'ini', cfg: 'ini', service: 'ini', timer: 'ini', socket: 'ini', path: 'ini', md: 'markdown',
+  markdown: 'markdown', html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml', css: 'css', scss: 'scss', less: 'less',
+  sql: 'sql', graphql: 'graphql', diff: 'diff', patch: 'diff', mk: 'makefile',
+};
+const MAX_HIGHLIGHT_CHARS = 600000;
+
+function hlLanguage(path) {
+  const name = path.split('/').pop();
+  let lang = null;
+  if (/^Dockerfile|\.dockerfile$/i.test(name)) lang = 'dockerfile';
+  else if (/^(GNU)?makefile$/i.test(name)) lang = 'makefile';
+  else if (/nginx.*\.conf$|\.nginx$/i.test(name)) lang = 'nginx';
+  else if (name.includes('.')) lang = HL_BY_EXT[name.split('.').pop().toLowerCase()] || null;
+  return lang && window.hljs?.getLanguage(lang) ? lang : null;
+}
+
+/** Split highlighted HTML into lines, closing and reopening spans that cross a line break. */
+function splitHtmlLines(html) {
+  const lines = [];
+  const open = [];
+  let cur = '';
+  const re = /(<span[^>]*>)|(<\/span>)|(\n)|([^<\n]+)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    if (m[1]) { open.push(m[1]); cur += m[1]; }
+    else if (m[2]) { open.pop(); cur += m[2]; }
+    else if (m[3]) { lines.push(cur + '</span>'.repeat(open.length)); cur = open.join(''); }
+    else cur += m[4];
+  }
+  lines.push(cur + '</span>'.repeat(open.length));
+  return lines;
+}
+
+/** Per-line HTML for a file: highlighted when the language is known, escaped text otherwise. */
+function highlightLines(text, path) {
+  const lang = text.length <= MAX_HIGHLIGHT_CHARS ? hlLanguage(path) : null;
+  if (lang) {
+    try {
+      return splitHtmlLines(hljs.highlight(text, { language: lang, ignoreIllegals: true }).value);
+    } catch {
+      // fall through to plain text
+    }
+  }
+  return text.split('\n').map(esc);
+}
+
+function highlightBlock(code, lang) {
+  const known = lang && window.hljs?.getLanguage(lang) ? lang : null;
+  if (!known) return esc(code);
+  try {
+    return hljs.highlight(code, { language: known, ignoreIllegals: true }).value;
+  } catch {
+    return esc(code);
+  }
+}
+
+// ---------- markdown (answers, hover docs) ----------
+
+const LOC_RE = /^((?:[\w.@-]+\/)*[\w.@-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?$/;
+const LOC_IN_TEXT_RE = /(^|[\s(\[“"'])((?:[\w.@-]+\/)*[\w.@-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?/g;
+
+function locLink(path, line, label) {
+  return `<a class="loc" data-src="${esc(path)}" data-line="${line}">${label}</a>`;
+}
+
+function mdInline(text) {
+  // Code spans become placeholders so emphasis can wrap them (`**`x`**`).
+  const codes = [];
+  const masked = String(text).replace(/`([^`\n]+)`/g, (_, code) => {
+    const loc = code.match(LOC_RE);
+    codes.push(loc ? locLink(loc[1], loc[2], `<code>${esc(code)}</code>`) : `<code>${esc(code)}</code>`);
+    return `\u0001${codes.length - 1}\u0002`;
+  });
+  return esc(masked)
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\w)/g, '$1<i>$2</i>')
+    .replace(/\[([^\]]+)\]\([^)\s]+\)/g, '$1')
+    .replace(LOC_IN_TEXT_RE, (all, pre, path, line, end) => pre + locLink(path, line, `${path}:${line}${end ? `-${end}` : ''}`))
+    .replace(/\n/g, '<br>')
+    .replace(/\u0001(\d+)\u0002/g, (_, i) => codes[Number(i)]);
+}
+
+/** Markdown subset: fenced code, headings, lists, paragraphs, inline code/bold/italic, `path:line` links. */
+function mdBlock(text) {
+  const out = [];
+  const lines = String(text ?? '').replace(/\r/g, '').split('\n');
+  let para = [];
+  let list = null;
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${mdInline(para.join('\n'))}</p>`);
+    para = [];
+  };
+  const flushList = () => {
+    if (list) {
+      const start = list.type === 'ol' && list.start !== 1 ? ` start="${list.start}"` : '';
+      out.push(`<${list.type}${start}>${list.items.map((it) => `<li>${mdInline(it)}</li>`).join('')}</${list.type}>`);
+    }
+    list = null;
+  };
+  const ITEM_RE = /^\s*([-*+]|\d+[.)])\s+(.*)/;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```\s*([\w+#.-]*)/);
+    if (fence) {
+      flushPara(); flushList();
+      const code = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      out.push(`<pre class="md-code hljs"><code>${highlightBlock(code.join('\n'), fence[1].toLowerCase())}</code></pre>`);
+      continue;
+    }
+    const heading = line.match(/^#{1,6}\s+(.*)/);
+    if (heading) { flushPara(); flushList(); out.push(`<h4 class="md-h">${mdInline(heading[1])}</h4>`); continue; }
+    const item = line.match(ITEM_RE);
+    if (item) {
+      flushPara();
+      const type = /\d/.test(item[1]) ? 'ol' : 'ul';
+      if (list?.type !== type) { flushList(); list = { type, items: [], start: parseInt(item[1], 10) || 1 }; }
+      list.items.push(item[2]);
+      continue;
+    }
+    if (!line.trim()) {
+      flushPara();
+      // A blank line between items keeps the list (and its numbering) going.
+      const next = lines.slice(i + 1).find((l) => l.trim());
+      const nextItem = next?.match(ITEM_RE);
+      if (!list || !nextItem || (/\d/.test(nextItem[1]) ? 'ol' : 'ul') !== list.type) flushList();
+      continue;
+    }
+    if (list && /^\s{2,}\S/.test(line)) { list.items[list.items.length - 1] += ` ${line.trim()}`; continue; }
+    flushList();
+    para.push(line);
+  }
+  flushPara(); flushList();
+  return `<div class="md">${out.join('')}</div>`;
+}
+
+// ---------- source viewer (L3) with navigation ----------
+
+const viewer = { path: null, line: 0, history: [], index: -1, lsp: null, lines: [] };
+
+function updateHistoryButtons() {
+  $('#src-back').disabled = viewer.index <= 0;
+  $('#src-fwd').disabled = viewer.index >= viewer.history.length - 1;
+}
+
+/** Open a file (or directory) at a 1-based line. History entries are pushed unless navigating it. */
+async function openSource(path, line, { push = true } = {}) {
+  if ($('#modal').hidden) { viewer.history = []; viewer.index = -1; }
+  if (push) {
+    viewer.history = viewer.history.slice(0, viewer.index + 1);
+    viewer.history.push({ path, line });
+    viewer.index = viewer.history.length - 1;
+  }
+  updateHistoryButtons();
+  viewer.path = path;
+  viewer.line = line;
   $('#modal').hidden = false;
+  $('#sym').hidden = true;
   const body = $('#src-body');
   const parts = path === '.' ? [] : path.split('/');
   $('#src-path').innerHTML = [`<a data-open=".">${esc(state.repo?.name || '.')}</a>`, ...parts.map((p, i) =>
     i === parts.length - 1 ? esc(p) : `<a data-open="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</a>`)].join(' / ') + (line ? `:${line}` : '');
+  $('#src-lsp').hidden = true;
   body.innerHTML = '<p class="muted" style="padding:16px">Loading…</p>';
   let res;
   try {
@@ -809,25 +977,201 @@ async function openSource(path, line) {
     body.innerHTML = `<div class="src-error">${esc(err.message)}</div>`;
     return;
   }
+  if (viewer.path !== path) return;
   if (res.dir) {
+    viewer.lines = [];
     const base = res.path === '.' ? '' : `${res.path}/`;
     body.innerHTML = '<ul class="dir-list">' + res.entries.map((e) =>
       `<li><a data-open="${esc(base + e.name)}">${esc(e.name)}${e.dir ? '/' : ''}</a></li>`).join('') + '</ul>';
     return;
   }
-  const lines = res.text.split('\n');
-  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
-  body.innerHTML = lines.map((text, i) =>
-    `<div class="src-line${i + 1 === line ? ' target' : ''}" id="L${i + 1}"><span class="no">${i + 1}</span><span class="code">${esc(text) || ' '}</span></div>`).join('');
+  const text = res.text.endsWith('\n') ? res.text.slice(0, -1) : res.text;
+  viewer.lines = text.split('\n');
+  const html = highlightLines(text, path);
+  body.innerHTML = `<div class="src-hint">Click a name for its definition, documentation and references · Ctrl/⌘-click jumps to the definition · Alt+←/→ history</div>` +
+    html.map((h, i) => `<div class="src-line${i + 1 === line ? ' target' : ''}" data-line="${i + 1}" id="L${i + 1}"><span class="no">${i + 1}</span><span class="code">${h || ' '}</span></div>`).join('');
   const target = line && document.getElementById(`L${line}`);
   if (target) target.scrollIntoView({ block: 'center' });
   else body.scrollTop = 0;
+  refreshLspStatus(path, true);
 }
+
+async function refreshLspStatus(path, start) {
+  let status;
+  try {
+    status = await api(`/api/lsp/status?path=${encodeURIComponent(path)}${start ? '&start=true' : ''}`);
+  } catch {
+    status = { state: 'none' };
+  }
+  if (viewer.path !== path) return;
+  viewer.lsp = status;
+  const chip = $('#src-lsp');
+  // The server's executable, not wrapper words (`npx -y -p pyright@1 pyright-langserver --stdio`).
+  const words = status.server?.split(/\s+/).filter((w) => !w.startsWith('-')) || [];
+  const server = (words.find((w) => /langserver|language-server|analyzer|pylsp|gopls|clangd/.test(w)) || words[0] || '').split('/').pop();
+  const label = {
+    none: 'text search',
+    idle: `${server}: starting…`,
+    starting: `${server}: starting…`,
+    indexing: `${server}: indexing…`,
+    ready: `${server}`,
+    failed: `${server}: unavailable`,
+  }[status.state];
+  chip.className = `lsp-chip ${status.state}`;
+  chip.textContent = label;
+  chip.title = status.state === 'none'
+    ? 'No language server for this file type: navigation uses whole-word text search'
+    : status.error || status.server;
+  chip.hidden = false;
+  if (['idle', 'starting', 'indexing'].includes(status.state)) setTimeout(() => refreshLspStatus(path, false), 1500);
+}
+
+/** The identifier under a click point inside a `.code` element, with its UTF-16 column. */
+function wordAt(codeEl, x, y) {
+  let node, offset;
+  if (document.caretPositionFromPoint) {
+    const pos = document.caretPositionFromPoint(x, y);
+    node = pos?.offsetNode; offset = pos?.offset;
+  } else if (document.caretRangeFromPoint) {
+    const range = document.caretRangeFromPoint(x, y);
+    node = range?.startContainer; offset = range?.startOffset;
+  }
+  if (!node || !codeEl.contains(node) || node.nodeType !== Node.TEXT_NODE) return null;
+  let column = 0;
+  const walker = document.createTreeWalker(codeEl, NodeFilter.SHOW_TEXT);
+  for (let t = walker.nextNode(); t && t !== node; t = walker.nextNode()) column += t.nodeValue.length;
+  column += offset;
+  const text = codeEl.textContent;
+  const isWord = (c) => /[\w$]/.test(c || '');
+  let start = column;
+  let end = column;
+  while (start > 0 && isWord(text[start - 1])) start--;
+  while (end < text.length && isWord(text[end])) end++;
+  if (start === end) return null;
+  const word = text.slice(start, end);
+  return /^\d+$/.test(word) ? null : { word, start };
+}
+
+function locItems(locations, { group = false } = {}) {
+  if (!locations.length) return '<p class="muted">None found.</p>';
+  const item = (l) => l.path
+    ? `<li data-go="${esc(l.path)}" data-line="${l.line}"><div class="where">${esc(group ? `${l.line}` : `${l.display || l.path}:${l.line}`)}</div>${l.preview ? `<div class="preview">${esc(l.preview)}</div>` : ''}</li>`
+    : `<li class="external" title="Outside the repository"><div class="where">${esc(l.display)}:${l.line}</div></li>`;
+  if (!group) return `<ul class="loc-list">${locations.map(item).join('')}</ul>`;
+  const byFile = new Map();
+  for (const l of locations) {
+    const key = l.path ?? l.display;
+    if (!byFile.has(key)) byFile.set(key, []);
+    byFile.get(key).push(l);
+  }
+  return [...byFile].map(([file, ls]) => `<div class="loc-file">${esc(file)} <span class="muted">(${ls.length})</span></div><ul class="loc-list">${ls.map(item).join('')}</ul>`).join('');
+}
+
+/** Symbol pane: LSP hover/definitions/references, or whole-word text matches without a server. */
+async function showSymbol(sym, { jump = false } = {}) {
+  const pane = $('#sym');
+  pane.hidden = false;
+  const head = (extra = '') => `<div class="sym-head"><code>${esc(sym.word)}</code><span class="spacer"></span>${extra}<button type="button" data-sym-close title="Close">✕</button></div>`;
+  const usesLsp = viewer.lsp && viewer.lsp.state !== 'none' && viewer.lsp.state !== 'failed';
+  if (!usesLsp) {
+    pane.innerHTML = head() + `<p class="muted small">${viewer.lsp?.state === 'failed' ? `Language server unavailable (${esc(viewer.lsp.error || '')}).` : 'No language server for this file type.'} Showing whole-word text matches.</p><div id="sym-text"><p class="muted">Searching…</p></div>`;
+    return textSearch(sym.word);
+  }
+  pane.innerHTML = head() + '<p class="muted">Asking the language server…</p>';
+  let info;
+  try {
+    info = await post('/api/lsp/symbol', { path: sym.path, line: sym.line, character: sym.start });
+  } catch (err) {
+    pane.innerHTML = head() + `<p class="src-error" style="padding:0">${esc(err.message)}</p><div id="sym-text"><p class="muted">Searching text instead…</p></div>`;
+    return textSearch(sym.word);
+  }
+  const inRepo = info.definitions.filter((d) => d.path);
+  if (jump && inRepo.length === 1) return openSource(inRepo[0].path, inRepo[0].line);
+  pane.innerHTML = head() +
+    (info.hover ? `<div class="sym-hover">${mdBlock(info.hover)}</div>` : '') +
+    `<h3>Definition${info.definitions.length === 1 ? '' : 's'}</h3>${locItems(info.definitions)}` +
+    `<div class="actions"><button type="button" data-refs>Find references</button><button type="button" data-text>Text search</button></div>` +
+    '<div id="sym-refs"></div><div id="sym-text"></div>';
+  pane.querySelector('[data-refs]').onclick = async (e) => {
+    e.target.disabled = true;
+    const box = $('#sym-refs');
+    box.innerHTML = '<p class="muted">Finding references…</p>';
+    try {
+      const { references } = await post('/api/lsp/references', { path: sym.path, line: sym.line, character: sym.start });
+      box.innerHTML = `<h3>References (${references.length})</h3>${locItems(references, { group: true })}`;
+    } catch (err) {
+      box.innerHTML = `<p class="src-error" style="padding:0">${esc(err.message)}</p>`;
+    }
+  };
+  pane.querySelector('[data-text]').onclick = (e) => { e.target.disabled = true; textSearch(sym.word); };
+}
+
+async function textSearch(word) {
+  const box = $('#sym-text');
+  if (!box) return;
+  box.innerHTML = '<p class="muted">Searching…</p>';
+  try {
+    const res = await api(`/api/search?word=${encodeURIComponent(word)}&limit=300`);
+    box.innerHTML = `<h3>Text matches (${res.hits.length}${res.truncated ? '+' : ''})</h3>` +
+      locItems(res.hits.map((h) => ({ ...h, display: h.path })), { group: true });
+  } catch (err) {
+    box.innerHTML = `<p class="src-error" style="padding:0">${esc(err.message)}</p>`;
+  }
+}
+
+$('#src-body').addEventListener('click', (e) => {
+  if (String(window.getSelection())) return; // selecting text, not navigating
+  const codeEl = e.target.closest('.src-line .code');
+  if (!codeEl || !viewer.path) return;
+  const hit = wordAt(codeEl, e.clientX, e.clientY);
+  if (!hit) return;
+  const lineEl = codeEl.parentNode;
+  document.querySelectorAll('.src-line.sym-line').forEach((el) => el.classList.remove('sym-line'));
+  lineEl.classList.add('sym-line');
+  showSymbol({ path: viewer.path, line: Number(lineEl.dataset.line), start: hit.start, word: hit.word }, { jump: e.ctrlKey || e.metaKey });
+});
+
+$('#sym').addEventListener('click', (e) => {
+  if (e.target.closest('[data-sym-close]')) { $('#sym').hidden = true; return; }
+  const go = e.target.closest('[data-go], a.loc');
+  if (go) openSource(go.dataset.go ?? go.dataset.src, Number(go.dataset.line) || 0);
+});
+
+function historyStep(delta) {
+  const i = viewer.index + delta;
+  if (i < 0 || i >= viewer.history.length) return;
+  viewer.index = i;
+  const { path, line } = viewer.history[i];
+  openSource(path, line, { push: false });
+}
+$('#src-back').onclick = () => historyStep(-1);
+$('#src-fwd').onclick = () => historyStep(1);
 
 function closeSource() {
   $('#modal').hidden = true;
   $('#src-body').innerHTML = '';
+  $('#sym').hidden = true;
+  viewer.path = null;
 }
+
+/** Lines selected in the viewer (1-based, inclusive), or null for the whole file. */
+function selectedLines() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !$('#src-body').contains(sel.anchorNode)) return null;
+  const lineOf = (n) => Number((n.nodeType === Node.TEXT_NODE ? n.parentNode : n).closest?.('.src-line')?.dataset.line);
+  const a = lineOf(sel.anchorNode);
+  const b = lineOf(sel.focusNode);
+  if (!a || !b) return null;
+  return [Math.min(a, b), Math.max(a, b)];
+}
+
+$('#src-ask').onclick = () => {
+  if (!viewer.path || !viewer.lines.length) return;
+  const range = selectedLines();
+  state.askSelection = { path: viewer.path, start: range?.[0] ?? null, end: range?.[1] ?? null };
+  closeSource();
+  switchTab('ask');
+};
 
 $('#modal').addEventListener('click', (e) => {
   const open = e.target.closest('[data-open]');
@@ -836,13 +1180,160 @@ $('#modal').addEventListener('click', (e) => {
 });
 $('#src-close').onclick = closeSource;
 
+// ---------- ask ----------
+
+state.chat = [];
+state.askSelection = null;
+
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll('.tabs [data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  $('#panel').hidden = tab !== 'details';
+  $('#ask').hidden = tab !== 'ask';
+  $('#side').classList.toggle('wide', tab === 'ask');
+  if (tab === 'ask') {
+    renderAskContext();
+    renderChat();
+    $('#question').focus();
+  }
+  if (state.map && $('#screen').hidden) fit();
+}
+document.querySelectorAll('.tabs [data-tab]').forEach((b) => { b.onclick = () => switchTab(b.dataset.tab); });
+
+/** What the next question is about: current map, selected node, chosen source lines. */
+function askContext() {
+  const ctx = { scope: state.scope };
+  const chips = [];
+  const crumbs = state.map?.meta?.crumbs?.join(' › ') || state.repo?.name || 'repository';
+  chips.push(`<span class="chip">Map <b>${esc(crumbs)}</b></span>`);
+  const node = state.selected?.type === 'node' ? nodeById(state.selected.id) : null;
+  if (node) {
+    ctx.node = node.id;
+    chips.push(`<span class="chip">Component <b>${esc(node.name)}</b></span>`);
+  }
+  const sel = state.askSelection;
+  if (sel) {
+    Object.assign(ctx, { path: sel.path, start_line: sel.start, end_line: sel.end });
+    const where = sel.start ? `${sel.path}:${sel.start}${sel.end !== sel.start ? `-${sel.end}` : ''}` : sel.path;
+    chips.push(`<span class="chip">Code <b>${esc(where)}</b><button type="button" data-drop-sel title="Remove">✕</button></span>`);
+  }
+  return { ctx, chips, label: [crumbs, node?.name, sel && (sel.start ? `${sel.path}:${sel.start}-${sel.end}` : sel.path)].filter(Boolean).join(' · ') };
+}
+
+function renderAskContext() {
+  $('#ask-context').innerHTML = askContext().chips.join('');
+}
+
+$('#ask-context').addEventListener('click', (e) => {
+  if (e.target.closest('[data-drop-sel]')) { state.askSelection = null; renderAskContext(); }
+});
+
+function renderEntry(entry) {
+  const q = `<div class="msg-q">${esc(entry.question)}</div><div class="msg-ctx">${esc(entry.label)}</div>`;
+  if (entry.status === 'running') {
+    return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>Codex is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
+      <button type="button" data-cancel="${entry.job}">Cancel</button></div>${entry.last ? `<div class="last">${esc(entry.last)}</div>` : ''}</div>`;
+  }
+  if (entry.status !== 'done') {
+    return q + `<div class="msg-a"><div class="error">${esc(entry.error || entry.status)}</div>
+      <div class="actions"><button type="button" data-retry="${entry.id}">Ask again</button></div></div>`;
+  }
+  const r = entry.result;
+  const cites = r.citations.length ? `<h4 class="md-h">Citations</h4>${evidenceList(r.citations)}` : '';
+  return q + `<div class="msg-a">${mdBlock(r.answer)}${cites}
+    <p class="meta">${fmtDuration(r.duration_ms)} · ${r.commands} commands · ${fmtTokens(r.input_tokens)} in / ${fmtTokens(r.output_tokens)} out tokens</p></div>`;
+}
+
+function renderChat() {
+  const chat = $('#chat');
+  const stick = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 40;
+  chat.innerHTML = state.chat.length ? state.chat.map(renderEntry).join('') : `<div class="chat-empty">
+    <p>Ask anything about this repository. The question includes what you are looking at:</p>
+    <ul><li>the current map, and the selected component;</li><li>code lines chosen with <b>Ask about selection</b> in the source viewer.</li></ul>
+    <p>Answers cite <code>file:line</code>; click a citation to open it.</p></div>`;
+  if (stick) chat.scrollTop = chat.scrollHeight;
+  $('#ask-busy').hidden = !state.chat.some((e) => e.status === 'running');
+}
+
+async function sendQuestion(question, ctxInfo) {
+  const { ctx, label } = ctxInfo || askContext();
+  const history = state.chat.filter((e) => e.status === 'done').map((e) => ({ question: e.question, answer: e.result.answer }));
+  const entry = { id: state.chat.length, question, label, ctx, status: 'running', elapsed: 0, last: '' };
+  state.chat.push(entry);
+  renderChat();
+  $('#chat').scrollTop = $('#chat').scrollHeight;
+  try {
+    const res = await post('/api/ask', { question, context: ctx, history });
+    entry.job = res.job;
+  } catch (err) {
+    Object.assign(entry, { status: 'failed', error: err.message });
+    return renderChat();
+  }
+  let since = 0;
+  const tick = async () => {
+    let job;
+    try {
+      job = await api(`/api/job/${entry.job}?since=${since}`);
+    } catch (err) {
+      Object.assign(entry, { status: 'failed', error: err.message });
+      return renderChat();
+    }
+    since = job.next;
+    const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
+    if (lines.length) entry.last = lines[lines.length - 1];
+    entry.elapsed = job.elapsed_ms;
+    if (job.status === 'running') {
+      setTimeout(tick, 1000);
+    } else if (job.status === 'done') {
+      Object.assign(entry, { status: 'done', result: job.result });
+    } else {
+      Object.assign(entry, { status: job.status, error: job.status === 'cancelled' ? 'Cancelled.' : job.error });
+    }
+    if (state.tab === 'ask') renderChat();
+    else $('#ask-busy').hidden = !state.chat.some((e) => e.status === 'running');
+  };
+  tick();
+}
+
+function submitQuestion() {
+  const box = $('#question');
+  const question = box.value.trim();
+  if (!question) return;
+  box.value = '';
+  sendQuestion(question);
+}
+
+$('#ask-send').onclick = submitQuestion;
+$('#question').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitQuestion(); }
+});
+
+$('#chat').addEventListener('click', (e) => {
+  const loc = e.target.closest('[data-src]');
+  if (loc) return openSource(loc.dataset.src, Number(loc.dataset.line) || 0);
+  const cancel = e.target.closest('[data-cancel]');
+  if (cancel) { cancel.disabled = true; return post(`/api/job/${cancel.dataset.cancel}/cancel`).catch(() => {}); }
+  const retry = e.target.closest('[data-retry]');
+  if (retry) {
+    const old = state.chat[Number(retry.dataset.retry)];
+    sendQuestion(old.question, { ctx: old.ctx, label: old.label });
+  }
+});
+
 window.addEventListener('keydown', (e) => {
+  const modalOpen = !$('#modal').hidden;
   if (e.key === 'Escape') {
-    if (!$('#modal').hidden) return closeSource();
+    if (modalOpen && !$('#sym').hidden) { $('#sym').hidden = true; return; }
+    if (modalOpen) return closeSource();
+    if (e.target.closest('input, textarea')) return;
     if (state.selected || state.flow !== null) { state.selected = null; state.flow = null; applyHighlight(); renderPanel(); }
     return;
   }
-  if (e.target.closest('input, textarea') || !$('#modal').hidden) return;
+  if (modalOpen && e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+    e.preventDefault();
+    return historyStep(e.key === 'ArrowLeft' ? -1 : 1);
+  }
+  if (e.target.closest('input, textarea') || modalOpen) return;
   if (e.key === 'f' || e.key === 'F') fit();
 });
 

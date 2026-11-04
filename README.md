@@ -29,8 +29,8 @@ cargo build --release
 ```
 
 Options: `--port`, `--host` (keep loopback; the API serves repository files),
-`--model`, `--codex <path>`, `--timeout-mins` (per exploration, default 20),
-`--cache-dir`.
+`--model`, `--codex <path>`, `--timeout-mins` (per exploration or question, default 20),
+`--cache-dir`, `--lsp LANG=COMMAND` (repeatable), `--no-lsp`.
 
 Opening the UI starts the system exploration if no map is cached. That usually takes
 a few minutes on a mid-size repository; progress shows each command Codex runs.
@@ -45,6 +45,49 @@ a few minutes on a mid-size repository; progress shows each command Codex runs.
 - Drag a box to move it when labels overlap; edges follow. Positions are saved per
   map (repository, commit, level) in browser storage. **Reset layout** discards them.
 - Mouse wheel zooms, dragging the background pans, `F` fits, `Esc` clears the selection.
+
+## Reading source
+
+The source viewer highlights syntax (highlight.js, bundled; no network access).
+
+- Click a name: the side pane shows its documentation/signature, definitions and, on
+  request, references. Ctrl/⌘-click jumps straight to a single definition.
+- **‹ / ›** or Alt+←/→ walk the navigation history.
+- The chip in the header shows the language server state. Files without a server
+  (YAML, shell, configs, …) or with a failed server fall back to whole-word text
+  search across the repository (respecting `.gitignore`).
+
+Language servers are found on `PATH` and started on first use, one per language,
+with the repository as workspace:
+
+| Language | Servers tried |
+| --- | --- |
+| Rust | `rust-analyzer` (build scripts and proc macros disabled) |
+| Python | `pyright-langserver --stdio`, `basedpyright-langserver --stdio`, `pylsp`, `jedi-language-server` |
+| TypeScript / JavaScript | `typescript-language-server --stdio` |
+| Go | `gopls` |
+| C / C++ | `clangd` |
+
+Override or add one with `--lsp`, e.g. pyright without a global install:
+
+```sh
+code-explore /path/to/repo --lsp "python=npx -y -p pyright@1 pyright-langserver --stdio"
+```
+
+`--lsp python=` disables a language. Language servers can run project tooling
+(for example `gopls` runs `go list`, TypeScript loads tsconfig plugins); use
+`--no-lsp` for repositories you do not trust.
+
+## Asking questions
+
+The **Ask** tab sends a question to Codex (same read-only sandbox) together with what
+you are looking at: the current map, the selected component, and code lines chosen
+with **Ask about selection** in the source viewer (whole file if nothing is
+selected). Earlier questions in the conversation are included for follow-ups.
+
+Answers are Markdown; every `path:line` in them opens the source viewer, and the
+citation list is checked against the files like map evidence. The conversation lives
+in the page and is lost on reload.
 
 ## Trust model
 

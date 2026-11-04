@@ -1,9 +1,9 @@
-//! Runs `codex exec` as a read-only exploration agent inside the target
-//! repository and returns its schema-constrained map.
+//! Runs `codex exec` as a read-only agent inside the target repository and
+//! returns its schema-constrained JSON answer (a map, or an answer to a question).
 
-use crate::map::Map;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -21,11 +21,10 @@ pub struct AgentConfig {
     pub bin: String,
     pub model: Option<String>,
     pub timeout: Duration,
-    pub schema_path: PathBuf,
 }
 
-pub struct Outcome {
-    pub map: Map,
+pub struct Outcome<T> {
+    pub answer: T,
     pub commands: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -122,20 +121,21 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
-pub async fn explore(
+pub async fn run<T: DeserializeOwned>(
     cfg: &AgentConfig,
     root: &Path,
+    schema: &Path,
     prompt: &str,
     cancel: &Notify,
     mut progress: impl FnMut(String),
-) -> Result<Outcome, String> {
+) -> Result<Outcome<T>, String> {
     let mut cmd = Command::new(&cfg.bin);
     cmd.args(["exec", "--json", "--color", "never", "--sandbox", "read-only"])
         .args(["-c", "approval_policy=\"never\"", "--skip-git-repo-check", "--ephemeral"]);
     for feature in DISABLED_FEATURES {
         cmd.args(["--disable", feature]);
     }
-    cmd.arg("--cd").arg(root).arg("--output-schema").arg(&cfg.schema_path);
+    cmd.arg("--cd").arg(root).arg("--output-schema").arg(schema);
     if let Some(model) = &cfg.model {
         cmd.args(["--model", model]);
     }
@@ -200,10 +200,10 @@ pub async fn explore(
         let detail = stream.last_error.unwrap_or_else(|| stderr_text.trim().to_owned());
         return Err(format!("codex exited ({status}) without an answer: {detail}"));
     };
-    let map = serde_json::from_str(answer.trim())
-        .map_err(|e| format!("codex answer is not a valid map ({e}): {}", one_line(&answer, 400)))?;
+    let answer = serde_json::from_str(answer.trim())
+        .map_err(|e| format!("codex answer does not match the schema ({e}): {}", one_line(&answer, 400)))?;
     Ok(Outcome {
-        map,
+        answer,
         commands: stream.commands,
         input_tokens: stream.input_tokens,
         output_tokens: stream.output_tokens,

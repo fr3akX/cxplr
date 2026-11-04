@@ -69,6 +69,14 @@ impl Verifier<'_> {
     }
 }
 
+/// Mark each citation verified or not (answers to questions).
+pub fn verify_citations(root: &Path, citations: &mut [Evidence]) {
+    let mut verifier = Verifier { root, lines: HashMap::new() };
+    for ev in citations {
+        verifier.check(ev);
+    }
+}
+
 /// Normalize node paths and mark every citation verified or not.
 pub fn verify(root: &Path, map: &mut Map) {
     let mut verifier = Verifier { root, lines: HashMap::new() };

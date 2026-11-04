@@ -1,11 +1,12 @@
-//! Local HTTP API and embedded web UI. Exploration runs as background jobs;
-//! the UI polls their progress.
+//! Local HTTP API and embedded web UI. Explorations and questions run as
+//! background jobs that the UI polls; source navigation goes through LSP.
 
 use crate::agent::{self, AgentConfig};
 use crate::cache::Cache;
+use crate::lsp::Lsp;
 use crate::map::{self, Map, Meta, Node};
 use crate::repo::Repo;
-use crate::{prompt, verify};
+use crate::{ask, prompt, search, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +16,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -27,6 +29,9 @@ pub struct AppState {
     repo: Repo,
     cache: Cache,
     agent: AgentConfig,
+    lsp: Lsp,
+    map_schema: PathBuf,
+    ask_schema: PathBuf,
     jobs: Mutex<Jobs>,
 }
 
@@ -34,12 +39,14 @@ pub struct AppState {
 struct Jobs {
     next_id: u64,
     by_id: HashMap<u64, Arc<Job>>,
-    /// Running job per scope, so concurrent requests share one exploration.
+    /// Running exploration per scope, so concurrent requests share one run.
     running: HashMap<String, u64>,
 }
 
 struct Job {
     id: u64,
+    /// `explore` or `ask`.
+    kind: &'static str,
     scope: String,
     cancel: Notify,
     started: Instant,
@@ -50,6 +57,7 @@ struct JobInner {
     status: &'static str,
     progress: Vec<String>,
     error: Option<String>,
+    result: Option<Value>,
 }
 
 impl Job {
@@ -61,13 +69,61 @@ impl Job {
     }
 }
 
+pub struct Schemas {
+    pub map: PathBuf,
+    pub ask: PathBuf,
+}
+
 impl AppState {
-    pub fn new(repo: Repo, cache: Cache, agent: AgentConfig) -> Arc<AppState> {
-        Arc::new(AppState { repo, cache, agent, jobs: Mutex::default() })
+    pub fn new(repo: Repo, cache: Cache, agent: AgentConfig, lsp: Lsp, schemas: Schemas) -> Arc<AppState> {
+        Arc::new(AppState {
+            repo,
+            cache,
+            agent,
+            lsp,
+            map_schema: schemas.map,
+            ask_schema: schemas.ask,
+            jobs: Mutex::default(),
+        })
     }
 
     fn running_job(&self, scope: &str) -> Option<u64> {
         self.jobs.lock().unwrap().running.get(scope).copied()
+    }
+
+    /// Register a job; the caller holds `jobs` so dedupe checks and insertion are atomic.
+    fn new_job(jobs: &mut Jobs, kind: &'static str, scope: String) -> Arc<Job> {
+        jobs.next_id += 1;
+        let job = Arc::new(Job {
+            id: jobs.next_id,
+            kind,
+            scope,
+            cancel: Notify::new(),
+            started: Instant::now(),
+            inner: Mutex::new(JobInner { status: "running", progress: Vec::new(), error: None, result: None }),
+        });
+        jobs.by_id.insert(job.id, job.clone());
+        job
+    }
+
+    fn finish(&self, job: &Job, result: Result<Option<Value>, String>) {
+        {
+            let mut inner = job.inner.lock().unwrap();
+            match result {
+                Ok(value) => {
+                    inner.status = "done";
+                    inner.result = value;
+                }
+                Err(e) if e == "cancelled" => inner.status = "cancelled",
+                Err(e) => {
+                    inner.status = "failed";
+                    inner.error = Some(e);
+                }
+            }
+        }
+        if job.kind == "explore" {
+            self.jobs.lock().unwrap().running.remove(&job.scope);
+        }
     }
 }
 
@@ -82,12 +138,19 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/", get(|| asset("text/html; charset=utf-8", include_str!("../web/index.html"))))
         .route("/app.js", get(|| asset("text/javascript; charset=utf-8", include_str!("../web/app.js"))))
         .route("/style.css", get(|| asset("text/css; charset=utf-8", include_str!("../web/style.css"))))
+        .route("/vendor/highlight.js", get(|| asset("text/javascript; charset=utf-8", include_str!("../web/vendor/highlight.js"))))
+        .route("/vendor/highlight.css", get(|| asset("text/css; charset=utf-8", include_str!("../web/vendor/highlight.css"))))
         .route("/api/repo", get(repo_info))
         .route("/api/map", get(get_map))
         .route("/api/explore", post(explore))
+        .route("/api/ask", post(ask_question))
         .route("/api/job/{id}", get(job_status))
         .route("/api/job/{id}/cancel", post(cancel_job))
         .route("/api/source", get(source))
+        .route("/api/search", get(text_search))
+        .route("/api/lsp/status", get(lsp_status))
+        .route("/api/lsp/symbol", post(lsp_symbol))
+        .route("/api/lsp/references", post(lsp_references))
         .with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -181,15 +244,7 @@ async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest
         if !req.force && st.cache.load(&req.scope).is_some() {
             return Ok(Json(json!({ "status": "ready" })));
         }
-        jobs.next_id += 1;
-        let job = Arc::new(Job {
-            id: jobs.next_id,
-            scope: req.scope.clone(),
-            cancel: Notify::new(),
-            started: Instant::now(),
-            inner: Mutex::new(JobInner { status: "running", progress: Vec::new(), error: None }),
-        });
-        jobs.by_id.insert(job.id, job.clone());
+        let job = AppState::new_job(&mut jobs, "explore", req.scope.clone());
         jobs.running.insert(job.scope.clone(), job.id);
         job
     };
@@ -200,18 +255,7 @@ async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest
 
 async fn run_job(st: Arc<AppState>, job: Arc<Job>, lineage: Option<Lineage>) {
     let result = explore_scope(&st, &job, lineage).await;
-    {
-        let mut inner = job.inner.lock().unwrap();
-        match result {
-            Ok(()) => inner.status = "done",
-            Err(e) if e == "cancelled" => inner.status = "cancelled",
-            Err(e) => {
-                inner.status = "failed";
-                inner.error = Some(e);
-            }
-        }
-    }
-    st.jobs.lock().unwrap().running.remove(&job.scope);
+    st.finish(&job, result.map(|()| None));
 }
 
 async fn explore_scope(st: &AppState, job: &Job, lineage: Option<Lineage>) -> Result<(), String> {
@@ -224,10 +268,11 @@ async fn explore_scope(st: &AppState, job: &Job, lineage: Option<Lineage>) -> Re
     };
     job.push(format!("Exploring {} with codex (read-only sandbox)", crumbs.join(" › ")));
     let started = Instant::now();
-    let out = agent::explore(&st.agent, &st.repo.root, &prompt, &job.cancel, |line| job.push(line)).await?;
+    let out = agent::run::<Map>(&st.agent, &st.repo.root, &st.map_schema, &prompt, &job.cancel, |line| job.push(line))
+        .await?;
 
     job.push("Verifying citations against the repository".into());
-    let mut map = out.map;
+    let mut map = out.answer;
     map.diagnostics.clear();
     map::normalize(&mut map);
     verify::verify(&st.repo.root, &mut map);
@@ -265,13 +310,71 @@ async fn job_status(
     let inner = job.inner.lock().unwrap();
     let from = q.since.min(inner.progress.len());
     Ok(Json(json!({
+        "kind": job.kind,
         "scope": job.scope,
         "status": inner.status,
         "error": inner.error,
+        "result": inner.result,
         "progress": inner.progress[from..],
         "next": inner.progress.len(),
         "elapsed_ms": job.started.elapsed().as_millis() as u64,
     })))
+}
+
+async fn ask_question(State(st): State<Arc<AppState>>, Json(req): Json<ask::Request>) -> ApiResult {
+    if req.question.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "the question is empty"));
+    }
+    let selection = match &req.context.path {
+        None => None,
+        Some(path) => {
+            let (full, shown) = verify::resolve(&st.repo.root, path).map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+            if full.is_dir() {
+                None
+            } else {
+                let bytes = fs::read(&full).map_err(|e| fail(StatusCode::BAD_REQUEST, format!("{shown}: {e}")))?;
+                let (first, text) =
+                    ask::selection(&String::from_utf8_lossy(&bytes), req.context.start_line, req.context.end_line);
+                Some((shown, first, text))
+            }
+        }
+    };
+    let job = AppState::new_job(&mut st.jobs.lock().unwrap(), "ask", req.context.scope.clone());
+    let id = job.id;
+    tokio::spawn(async move {
+        let result = answer_question(&st, &job, req, selection).await;
+        st.finish(&job, result.map(Some));
+    });
+    Ok(Json(json!({ "status": "running", "job": id })))
+}
+
+async fn answer_question(
+    st: &AppState,
+    job: &Job,
+    req: ask::Request,
+    selection: Option<(String, usize, String)>,
+) -> Result<Value, String> {
+    let map = st.cache.load(&req.context.scope);
+    let node = map.as_ref().zip(req.context.node.as_ref()).and_then(|(m, id)| m.nodes.iter().find(|n| &n.id == id));
+    let crumbs = map.as_ref().and_then(|m| m.meta.as_ref()).map_or_else(|| vec![st.repo.name.clone()], |m| m.crumbs.clone());
+    let view = ask::View { crumbs, map: map.as_ref(), node, selection };
+    let prompt = ask::prompt(&st.repo.name, &view, &req);
+    job.push("Asking codex (read-only sandbox)".into());
+    let started = Instant::now();
+    let out = agent::run::<ask::Answer>(&st.agent, &st.repo.root, &st.ask_schema, &prompt, &job.cancel, |line| {
+        job.push(line)
+    })
+    .await?;
+    let mut answer = out.answer;
+    verify::verify_citations(&st.repo.root, &mut answer.citations);
+    Ok(json!({
+        "answer": answer.answer,
+        "citations": answer.citations,
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "commands": out.commands,
+        "input_tokens": out.input_tokens,
+        "output_tokens": out.output_tokens,
+    }))
 }
 
 async fn cancel_job(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) -> ApiResult {
@@ -285,6 +388,69 @@ async fn cancel_job(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) 
 #[derive(Deserialize)]
 struct SourceQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    word: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    300
+}
+
+async fn text_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery>) -> ApiResult {
+    let word = q.word.trim().to_owned();
+    if word.is_empty() || word.len() > 200 || word.contains(char::is_whitespace) {
+        return Err(fail(StatusCode::BAD_REQUEST, "search for a single word"));
+    }
+    let root = st.repo.root.clone();
+    let limit = q.limit.clamp(1, 1000);
+    let results = tokio::task::spawn_blocking(move || search::search(&root, &word, limit))
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!(results)))
+}
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    path: String,
+    /// Start the server (and open the file) in the background if it is not running.
+    #[serde(default)]
+    start: bool,
+}
+
+async fn lsp_status(State(st): State<Arc<AppState>>, Query(q): Query<StatusQuery>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.repo.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let status = st.lsp.status(&shown).await;
+    if q.start && status.state == "idle" {
+        let st = st.clone();
+        tokio::spawn(async move { st.lsp.warm(&full, &shown).await });
+    }
+    Ok(Json(json!(status)))
+}
+
+#[derive(Deserialize)]
+struct PositionRequest {
+    path: String,
+    /// 1-based line.
+    line: u64,
+    /// 0-based UTF-16 column.
+    character: u64,
+}
+
+async fn lsp_symbol(State(st): State<Arc<AppState>>, Json(req): Json<PositionRequest>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.repo.root, &req.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let info = st.lsp.symbol(&full, &shown, req.line, req.character).await;
+    info.map(|i| Json(json!(i))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+async fn lsp_references(State(st): State<Arc<AppState>>, Json(req): Json<PositionRequest>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.repo.root, &req.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let refs = st.lsp.references(&full, &shown, req.line, req.character).await;
+    refs.map(|r| Json(json!({ "references": r }))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
 }
 
 /// L3: file contents or a directory listing, confined to the repository.
