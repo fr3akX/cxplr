@@ -23,18 +23,41 @@ map (see [Codex sessions](#codex-sessions)).
 
 ## Requirements
 
-- Rust toolchain (to build).
+- Rust toolchain (`cargo`), to install and update.
 - `codex` on `PATH`, logged in, with `codex app-server` (experimental in Codex 0.166;
   cxplr stops with a clear error if it is missing). Model and reasoning effort come from
   your Codex config unless `--model` is given.
 - Optional: language servers for code navigation (see [Source viewer](#source-viewer)).
 
+## Install
+
+```sh
+cargo install --git https://github.com/fr3akX/cxplr --locked
+```
+
+This builds the latest `main` and puts `cxplr` in `~/.cargo/bin` (make sure it is on
+your `PATH`). To pin a version, add `--rev <commit>`; to build from a checkout, run
+`cargo install --path . --locked` in it.
+
+### Updates
+
+A cxplr installed with `cargo install --git` keeps itself up to date. At most every
+6 hours it compares the commit it was built from with GitHub's `main`
+(`git ls-remote`, off the startup path); when `main` has moved on, it runs the same
+`cargo install` in the background (log: `~/.cache/cxplr/update.log`) and the new
+version is used from the next start. The running instance is not affected, and an
+installed Codex skill is refreshed on the first start of the new version.
+
+- `cxplr --update` updates now, in the foreground.
+- `--no-update`, or `CXPLR_NO_UPDATE=1`, skips the check.
+- Builds that cargo did not install from this repository (e.g. `cargo build` in a
+  checkout, or `cargo install --path`) never update themselves.
+
 ## Quick start
 
 ```sh
-cargo build --release
-./target/release/cxplr /path/to/repo --index   # map the project, then open the browser
-./target/release/cxplr /path/to/repo           # later: browse the cache at http://127.0.0.1:7878
+cxplr /path/to/repo --index   # map the project, then open the browser
+cxplr /path/to/repo           # later: browse the cache at http://127.0.0.1:7878
 ```
 
 `--index` prints progress for each exploration and opens the browser when done.
@@ -298,3 +321,5 @@ cxplr [REPO] [OPTIONS]
 | `--no-lsp` | | Disable language servers; navigation uses text search |
 | `--forget-sessions` | | Delete the Codex sessions cxplr created for `REPO` and exit |
 | `--install-skill` | | Install the cxplr skill for Codex and exit |
+| `--update` | | Update to the latest `main` now (`cargo install --git`) and exit |
+| `--no-update` | | Skip the automatic update check (also `CXPLR_NO_UPDATE=1`) |
