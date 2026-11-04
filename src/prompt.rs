@@ -128,3 +128,29 @@ component.
     );
     p
 }
+
+/// Update a stale map inside the session that made it: the earlier exploration and
+/// map are in context, so only the changed files need to be read again.
+pub fn refresh(changed: &[String], total: usize) -> String {
+    let mut p = String::from(RULES);
+    p.push_str(
+        "
+Task: your earlier map of this scope is above in this session, but the repository has \
+changed since. Files added, removed or changed:
+",
+    );
+    for f in changed {
+        let _ = writeln!(p, "- {f}");
+    }
+    if total > changed.len() {
+        let _ = writeln!(p, "- … and {} more (use `git status` and `git diff` to see them)", total - changed.len());
+    }
+    p.push_str(
+        "
+Re-read those files; what you saw before is out of date, including line numbers. Check whether \
+components, interactions or flows changed, and return the complete updated map for the same \
+scope. Keep node ids for parts that did not change, and re-verify every citation you keep.
+",
+    );
+    p
+}

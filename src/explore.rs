@@ -1,20 +1,23 @@
 //! Exploring one scope (system map or a component one level deeper), shared by
 //! the web server and the full-project indexer.
+//!
+//! Sessions mirror the map tree: the system map is explored in a new Codex
+//! session, each component in a fork of its parent's session, and a stale map is
+//! refreshed inside the session that made it.
 
-use crate::agent::{self, AgentConfig};
-use crate::cache::Cache;
+use crate::cache::{Cache, Freshness};
+use crate::codex::Codex;
 use crate::map::{self, Map, Meta, Node};
 use crate::repo::Repo;
 use crate::{prompt, verify};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 pub struct Explorer {
     pub repo: Repo,
     pub cache: Cache,
-    pub agent: AgentConfig,
-    pub map_schema: PathBuf,
+    pub codex: Arc<Codex>,
 }
 
 /// Everything needed to explore a scope below the system map.
@@ -23,6 +26,15 @@ pub struct Lineage {
     pub crumbs: Vec<(String, String)>,
     pub parent: Map,
     pub node: Node,
+}
+
+/// `a/b/c` → `a/b`; a top-level component's parent is the system map (`""`).
+pub fn parent_scope(scope: &str) -> Option<&str> {
+    if scope.is_empty() {
+        None
+    } else {
+        Some(scope.rfind('/').map_or("", |i| &scope[..i]))
+    }
 }
 
 impl Explorer {
@@ -58,6 +70,35 @@ impl Explorer {
         unreachable!("scope has at least one id")
     }
 
+    pub fn session_name(&self, what: &str) -> String {
+        format!("cxplr: {} › {what}", self.repo.name)
+    }
+
+    /// A new session that starts from `from`'s session when it has one (so it knows
+    /// what that exploration read), otherwise a fresh session.
+    pub async fn session_from(&self, from: Option<&str>, name: &str, progress: &mut impl FnMut(String)) -> Result<String, String> {
+        if let Some(parent) = from.and_then(|s| self.cache.session(s)) {
+            match self.codex.fork(&parent, name).await {
+                Ok(id) => {
+                    self.record(&id, name);
+                    progress(format!("Continuing from session {parent} (forked as {id})"));
+                    return Ok(id);
+                }
+                // The parent session may have been deleted; start over without it.
+                Err(e) => progress(format!("! cannot fork session {parent}: {e}; starting a new session")),
+            }
+        }
+        let id = self.codex.start_thread(name).await?;
+        self.record(&id, name);
+        progress(format!("New session {id}"));
+        Ok(id)
+    }
+
+    fn record(&self, id: &str, name: &str) {
+        // Losing the registry entry only means `--forget-sessions` misses it.
+        let _ = self.cache.record_session(id, name);
+    }
+
     /// Explore a scope with Codex, verify the answer and store it in the cache.
     pub async fn explore(
         &self,
@@ -66,7 +107,7 @@ impl Explorer {
         cancel: &Notify,
         mut progress: impl FnMut(String),
     ) -> Result<Map, String> {
-        let (prompt, mut crumbs, paths) = match lineage {
+        let (full_prompt, mut crumbs, paths) = match lineage {
             None => (prompt::system(&self.repo.name), vec![self.repo.name.clone()], vec![".".to_owned()]),
             Some(l) => (
                 prompt::component(&l.crumbs, &l.parent, &l.node),
@@ -77,9 +118,40 @@ impl Explorer {
         // The map describes the files as they were when the exploration started.
         let manifest = self.repo.manifest(&paths);
         let commit = self.repo.head();
-        progress(format!("Exploring {} with codex (read-only sandbox)", crumbs.join(" › ")));
+        let label = crumbs.join(" › ");
+        // `cxplr: <repo> › system map` / `cxplr: <repo> › Component › Sub`
+        let name = self.session_name(&if crumbs.len() > 1 { crumbs[1..].join(" › ") } else { "system map".into() });
+
+        // A stale map with a session is updated in that session; everything else
+        // is explored in a fork of the parent's session.
+        let stale = self.cache.load(&self.repo, scope).and_then(|c| match c.freshness {
+            Freshness::Stale { changed, total, .. } => Some((changed, total)),
+            Freshness::Fresh => None,
+        });
+        let (session, prompt, refreshed) = match (stale, self.cache.session(scope)) {
+            (Some((changed, total)), Some(session)) => {
+                progress(format!("Refreshing {label} in its session {session} ({total} files changed)"));
+                (session, prompt::refresh(&changed, total), true)
+            }
+            _ => {
+                progress(format!("Exploring {label} with codex (read-only sandbox)"));
+                let session = self.session_from(parent_scope(scope), &name, &mut progress).await?;
+                (session, full_prompt.clone(), false)
+            }
+        };
+
         let started = Instant::now();
-        let out = agent::run::<Map>(&self.agent, &self.repo.root, &self.map_schema, &prompt, cancel, &mut progress).await?;
+        let (session, refreshed, out) = match self.codex.turn::<Map>(&session, &prompt, &map::schema(), cancel, &mut progress).await {
+            Ok(out) => (session, refreshed, out),
+            // The map's session no longer exists (deleted): explore from scratch instead.
+            Err(e) if refreshed && e.starts_with("thread/resume") => {
+                progress(format!("! session {session} is gone ({e}); exploring from scratch"));
+                let fresh = self.session_from(parent_scope(scope), &name, &mut progress).await?;
+                let out = self.codex.turn::<Map>(&fresh, &full_prompt, &map::schema(), cancel, &mut progress).await?;
+                (fresh, false, out)
+            }
+            Err(e) => return Err(e),
+        };
 
         progress("Verifying citations against the repository".into());
         let mut map = out.answer;
@@ -95,13 +167,30 @@ impl Explorer {
             generated_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             commit: commit.clone(),
             dirty: self.repo.is_dirty(),
-            model: self.agent.model.clone(),
+            model: self.codex.model().map(str::to_owned),
             duration_ms: started.elapsed().as_millis() as u64,
             commands: out.commands,
             input_tokens: out.input_tokens,
             output_tokens: out.output_tokens,
+            cached_input_tokens: out.cached_input_tokens,
+            session: Some(session.clone()),
+            refreshed,
         });
-        self.cache.store(scope, &paths, manifest, commit, &map).map_err(|e| format!("saving map: {e}"))?;
+        self.cache
+            .store(scope, &paths, manifest, commit, Some(session), &map)
+            .map_err(|e| format!("saving map: {e}"))?;
         Ok(map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parent_scope;
+
+    #[test]
+    fn sessions_fork_from_the_enclosing_map() {
+        assert_eq!(parent_scope(""), None);
+        assert_eq!(parent_scope("hermes"), Some(""));
+        assert_eq!(parent_scope("hermes/runtime/x"), Some("hermes/runtime"));
     }
 }

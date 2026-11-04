@@ -10,15 +10,19 @@
 //!   served, marked stale with exactly which files changed, until it is refreshed.
 //! - `traces/<key>.json`: example inputs for one flow, keyed by the scope's content
 //!   key and the flow name.
+//! - `sessions.json`: every Codex session cxplr created (id → name), so they can be
+//!   deleted with `--forget-sessions`.
 
 use crate::map::Map;
 use crate::prompt;
 use crate::repo::{self, Manifest, Repo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const FORMAT: &str = "cxplr/2";
 
@@ -29,6 +33,9 @@ struct Binding {
     key: String,
     commit: Option<String>,
     manifest: Manifest,
+    /// Codex session that produced the map; deeper maps and questions fork it.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -47,6 +54,10 @@ pub struct Cached {
 pub struct Cache {
     dir: PathBuf,
     salt: String,
+    /// Serializes read-modify-write of `sessions.json` across concurrent jobs.
+    sessions_lock: Mutex<()>,
+    /// One atlas rebuild at a time.
+    atlas_lock: Mutex<()>,
 }
 
 fn digest(text: &str) -> String {
@@ -69,11 +80,15 @@ impl Cache {
             fs::write(ignore, "# cxplr cache: local only\n*\n")?;
         }
         let salt = format!("{FORMAT}|prompt {}|model {}", prompt::VERSION, model.unwrap_or("default"));
-        Ok(Cache { dir, salt })
+        Ok(Cache { dir, salt, sessions_lock: Mutex::new(()), atlas_lock: Mutex::new(()) })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn lock_atlas(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.atlas_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Key of the map for `scope` describing exactly the files in `manifest`.
@@ -118,11 +133,57 @@ impl Cache {
     }
 
     /// Store a map built from the files in `manifest` (taken when exploration started).
-    pub fn store(&self, scope: &str, paths: &[String], manifest: Manifest, commit: Option<String>, map: &Map) -> io::Result<()> {
+    pub fn store(
+        &self,
+        scope: &str,
+        paths: &[String],
+        manifest: Manifest,
+        commit: Option<String>,
+        session: Option<String>,
+        map: &Map,
+    ) -> io::Result<()> {
         let key = self.key(scope, &manifest);
         write_atomic(&self.map_file(&key), &serde_json::to_vec(map)?)?;
-        let binding = Binding { scope: scope.to_owned(), paths: paths.to_vec(), key, commit, manifest };
+        let binding = Binding { scope: scope.to_owned(), paths: paths.to_vec(), key, commit, manifest, session };
         write_atomic(&self.binding_file(scope), &serde_json::to_vec(&binding)?)
+    }
+
+    /// The Codex session behind the scope's latest map.
+    pub fn session(&self, scope: &str) -> Option<String> {
+        self.binding(scope)?.session
+    }
+
+    fn sessions_file(&self) -> PathBuf {
+        self.dir.join("sessions.json")
+    }
+
+    /// Every Codex session cxplr created for this project (id → name).
+    pub fn sessions(&self) -> BTreeMap<String, String> {
+        fs::read(self.sessions_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn record_session(&self, id: &str, name: &str) -> io::Result<()> {
+        let _guard = self.sessions_lock.lock().unwrap();
+        let mut all = self.sessions();
+        all.insert(id.to_owned(), name.to_owned());
+        write_atomic(&self.sessions_file(), &serde_json::to_vec_pretty(&all)?)
+    }
+
+    /// Forget deleted sessions: drop them from the registry and from every map binding.
+    pub fn forget_sessions(&self, deleted: &[String]) -> io::Result<()> {
+        let _guard = self.sessions_lock.lock().unwrap();
+        let mut all = self.sessions();
+        all.retain(|id, _| !deleted.contains(id));
+        write_atomic(&self.sessions_file(), &serde_json::to_vec_pretty(&all)?)?;
+        for entry in fs::read_dir(self.dir.join("scopes"))?.filter_map(Result::ok) {
+            let Ok(bytes) = fs::read(entry.path()) else { continue };
+            let Ok(mut b) = serde_json::from_slice::<Binding>(&bytes) else { continue };
+            if b.session.as_ref().is_some_and(|s| deleted.contains(s)) {
+                b.session = None;
+                write_atomic(&entry.path(), &serde_json::to_vec(&b)?)?;
+            }
+        }
+        Ok(())
     }
 
     /// Key for the example traces of `flow` in `scope`, if the scope has a map.
@@ -172,8 +233,9 @@ mod tests {
         let a = vec!["a".to_owned()];
         let b = vec!["b".to_owned()];
         assert!(cache.load(&repo, "a").is_none());
-        cache.store("a", &a, repo.manifest(&a), None, &map("A")).unwrap();
-        cache.store("b", &b, repo.manifest(&b), None, &map("B")).unwrap();
+        cache.store("a", &a, repo.manifest(&a), None, Some("session-a".into()), &map("A")).unwrap();
+        cache.store("b", &b, repo.manifest(&b), None, None, &map("B")).unwrap();
+        assert_eq!(cache.session("a").as_deref(), Some("session-a"));
         assert_eq!(cache.load(&repo, "a").unwrap().freshness, Freshness::Fresh);
 
         // Changing `b` leaves `a` fresh; `b` is served from its old map, marked stale

@@ -265,6 +265,25 @@ details summary { cursor: pointer; color: var(--muted); }
 .dir-list li { padding: 3px 0; }
 .dir-list a { color: var(--accent); cursor: pointer; }
 .src-error { padding: 16px; color: var(--err); }
+.inline-thread {
+  margin: 6px 16px 10px 72px; border: 1px solid var(--accent); border-radius: 8px; background: var(--surface);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; white-space: normal; max-width: 900px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, .08);
+}
+.it-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.it-head .spacer { flex: 1; }
+.it-head button { padding: 0 6px; }
+.it-entries { padding: 4px 12px; display: flex; flex-direction: column; gap: 10px; }
+.it-entries:empty { display: none; }
+.it-entries .msg-ctx { display: none; }
+.it-compose { display: flex; gap: 8px; padding: 8px 10px; align-items: flex-end; }
+.it-compose textarea {
+  flex: 1; resize: vertical; min-height: 40px; font: inherit; color: var(--fg); background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+}
+#sel-ask { position: fixed; z-index: 20; padding: 3px 10px; font-size: 12.5px; box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+#sel-ask[hidden] { display: none; }
+.thread-list { margin-bottom: 8px; }
 #sym {
   width: 400px; flex: none; border-left: 1px solid var(--border); overflow-y: auto; padding: 12px 14px 30px;
   font-size: 13px; background: var(--surface);

@@ -774,8 +774,9 @@ function renderPanelContent() {
     ${md(map.summary)}
     <p class="meta">
       ${meta?.commit ? `Commit <code>${esc(meta.commit.slice(0, 10))}</code>${meta.dirty ? ' <span class="warn">(uncommitted changes)</span>' : ''} · ` : ''}
-      ${meta ? `${new Date(meta.generated_at * 1000).toLocaleString()} · ${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in / ${fmtTokens(meta.output_tokens)} out tokens` : ''}
+      ${meta ? `${new Date(meta.generated_at * 1000).toLocaleString()} · ${meta.refreshed ? 'refreshed in ' : ''}${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in${meta.cached_input_tokens ? ` (${fmtTokens(meta.cached_input_tokens)} cached)` : ''} / ${fmtTokens(meta.output_tokens)} out tokens` : ''}
       ${meta?.model ? ` · ${esc(meta.model)}` : ''}
+      ${meta?.session ? ` · session <code title="Continue it in a terminal: codex resume ${esc(meta.session)}">${esc(meta.session.slice(0, 8))}</code>` : ''}
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>
@@ -1369,6 +1370,7 @@ async function openSource(path, line, { push = true } = {}) {
   const target = line && document.getElementById(`L${line}`);
   if (target) target.scrollIntoView({ block: 'center' });
   else body.scrollTop = 0;
+  threads.filter((t) => t.path === path).forEach(mountThread);
   refreshLspStatus(path, true);
 }
 
@@ -1530,7 +1532,82 @@ function closeSource() {
   viewer.path = null;
 }
 
-/** Lines selected in the viewer (1-based, inclusive), or null for the whole file. */
+// ---------- inline code threads ----------
+
+/**
+ * A conversation is the Ask tab's, or a thread under selected code lines. Each
+ * keeps its own Codex session: the first question forks the current map's
+ * session, follow-ups continue it.
+ */
+function conversation(id, extra) {
+  return { id, entries: [], session: null, ...extra };
+}
+const mainConv = conversation('main', { render: () => { if (state.tab === 'ask') renderChat(); updateAskBusy(); } });
+const threads = []; // conversations with { path, start, end, hidden }
+let threadSeq = 0;
+
+function convById(id) {
+  return id === 'main' ? mainConv : threads.find((t) => t.id === id);
+}
+
+function threadLabel(t) {
+  return t.start ? `${t.path}:${t.start}${t.end !== t.start ? `–${t.end}` : ''}` : t.path;
+}
+
+function threadEl(t) {
+  const el = document.createElement('div');
+  el.className = 'inline-thread';
+  el.dataset.thread = t.id;
+  el.innerHTML = `<div class="it-head"><b>${esc(t.start ? `Lines ${t.start}–${t.end}` : 'Whole file')}</b>
+      <span class="muted it-state"></span><span class="spacer"></span>
+      <button type="button" data-it-hide title="Hide (the thread stays in the Ask tab)">✕</button></div>
+    <div class="it-entries"></div>
+    <div class="it-compose"><textarea rows="2" placeholder="Ask about these lines… (Ctrl+Enter)"></textarea>
+      <button type="button" class="primary" data-it-send>Ask</button></div>`;
+  return el;
+}
+
+/** Place a thread in the open file: under its last line, or at the top for the whole file. */
+function mountThread(t) {
+  if (viewer.path !== t.path || t.hidden) return;
+  let el = $(`#src-body .inline-thread[data-thread="${t.id}"]`);
+  if (!el) {
+    el = threadEl(t);
+    const anchor = t.end ? document.getElementById(`L${t.end}`) : $('#src-body .src-hint');
+    anchor?.after(el);
+  }
+  renderThread(t);
+  return el;
+}
+
+function renderThread(t) {
+  updateAskBusy();
+  if (state.tab === 'ask') renderChat();
+  const el = $(`#src-body .inline-thread[data-thread="${t.id}"]`);
+  if (!el) return;
+  $('.it-entries', el).innerHTML = t.entries.map((e) => renderEntry(e, t.id)).join('');
+  $('.it-state', el).textContent = t.session ? 'conversation continues' : '';
+  $('[data-it-send]', el).disabled = t.entries.some((e) => e.status === 'running');
+}
+
+function openThread(path, start, end) {
+  let t = threads.find((x) => x.path === path && x.start === start && x.end === end);
+  if (!t) {
+    t = conversation(`t${++threadSeq}`, { path, start, end, hidden: false });
+    t.render = () => renderThread(t);
+    threads.push(t);
+  }
+  t.hidden = false;
+  const el = mountThread(t);
+  el?.scrollIntoView({ block: 'nearest' });
+  $('textarea', el)?.focus();
+}
+
+function threadContext(t) {
+  return { ctx: { scope: state.scope, path: t.path, start_line: t.start, end_line: t.end }, label: threadLabel(t) };
+}
+
+/** Lines selected in the viewer (1-based, inclusive), or null. */
 function selectedLines() {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !$('#src-body').contains(sel.anchorNode)) return null;
@@ -1544,10 +1621,58 @@ function selectedLines() {
 $('#src-ask').onclick = () => {
   if (!viewer.path || !viewer.lines.length) return;
   const range = selectedLines();
-  state.askSelection = { path: viewer.path, start: range?.[0] ?? null, end: range?.[1] ?? null };
-  closeSource();
-  switchTab('ask');
+  openThread(viewer.path, range?.[0] ?? null, range?.[1] ?? null);
 };
+
+// Selecting code offers an inline question right where the selection ends.
+const selAsk = $('#sel-ask');
+$('#src-body').addEventListener('mouseup', (e) => {
+  if (e.target.closest('.inline-thread')) return;
+  setTimeout(() => {
+    const range = selectedLines();
+    if (!range || !viewer.lines.length) { selAsk.hidden = true; return; }
+    selAsk.textContent = range[0] === range[1] ? `Ask about line ${range[0]}` : `Ask about lines ${range[0]}–${range[1]}`;
+    selAsk.dataset.start = range[0];
+    selAsk.dataset.end = range[1];
+    selAsk.style.left = `${Math.min(e.clientX + 10, window.innerWidth - 220)}px`;
+    selAsk.style.top = `${e.clientY + 12}px`;
+    selAsk.hidden = false;
+  }, 0);
+});
+document.addEventListener('mousedown', (e) => { if (e.target !== selAsk) selAsk.hidden = true; });
+$('#src-body').addEventListener('scroll', () => { selAsk.hidden = true; });
+selAsk.onclick = () => {
+  selAsk.hidden = true;
+  openThread(viewer.path, Number(selAsk.dataset.start), Number(selAsk.dataset.end));
+  window.getSelection()?.removeAllRanges();
+};
+
+function sendThreadQuestion(el) {
+  const t = convById(el.dataset.thread);
+  const box = $('textarea', el);
+  const question = box.value.trim();
+  if (!t || !question || t.entries.some((x) => x.status === 'running')) return;
+  box.value = '';
+  const { ctx, label } = threadContext(t);
+  sendQuestion(t, question, ctx, label);
+}
+
+$('#src-body').addEventListener('click', (e) => {
+  const el = e.target.closest('.inline-thread');
+  if (!el) return;
+  if (e.target.closest('[data-it-send]')) return sendThreadQuestion(el);
+  if (e.target.closest('[data-it-hide]')) {
+    convById(el.dataset.thread).hidden = true;
+    el.remove();
+    if (state.tab === 'ask') renderChat();
+    return;
+  }
+  conversationClick(e);
+});
+$('#src-body').addEventListener('keydown', (e) => {
+  const el = e.target.closest('.inline-thread');
+  if (el && e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendThreadQuestion(el); }
+});
 
 $('#modal').addEventListener('click', (e) => {
   const open = e.target.closest('[data-open]');
@@ -1558,8 +1683,6 @@ $('#src-close').onclick = closeSource;
 
 // ---------- ask ----------
 
-state.chat = [];
-state.askSelection = null;
 
 function switchTab(tab) {
   state.tab = tab;
@@ -1582,18 +1705,15 @@ function askContext() {
   const chips = [];
   const crumbs = state.map?.meta?.crumbs?.join(' › ') || state.repo?.name || 'repository';
   chips.push(`<span class="chip">Map <b>${esc(crumbs)}</b></span>`);
+  chips.push(mainConv.session
+    ? `<span class="chip" title="Follow-ups continue Codex session ${esc(mainConv.session)}">Conversation <b>continues</b><button type="button" data-new-conv title="Start a new conversation from the current map's session">✕</button></span>`
+    : '<span class="chip" title="The first question forks the session that explored this map">Conversation <b>new</b></span>');
   const node = state.selected?.type === 'node' ? nodeById(state.selected.id) : null;
   if (node) {
     ctx.node = node.id;
     chips.push(`<span class="chip">Component <b>${esc(node.name)}</b></span>`);
   }
-  const sel = state.askSelection;
-  if (sel) {
-    Object.assign(ctx, { path: sel.path, start_line: sel.start, end_line: sel.end });
-    const where = sel.start ? `${sel.path}:${sel.start}${sel.end !== sel.start ? `-${sel.end}` : ''}` : sel.path;
-    chips.push(`<span class="chip">Code <b>${esc(where)}</b><button type="button" data-drop-sel title="Remove">✕</button></span>`);
-  }
-  return { ctx, chips, label: [crumbs, node?.name, sel && (sel.start ? `${sel.path}:${sel.start}-${sel.end}` : sel.path)].filter(Boolean).join(' · ') };
+  return { ctx, chips, label: [crumbs, node?.name].filter(Boolean).join(' · ') };
 }
 
 function renderAskContext() {
@@ -1601,10 +1721,10 @@ function renderAskContext() {
 }
 
 $('#ask-context').addEventListener('click', (e) => {
-  if (e.target.closest('[data-drop-sel]')) { state.askSelection = null; renderAskContext(); }
+  if (e.target.closest('[data-new-conv]')) { mainConv.session = null; renderAskContext(); }
 });
 
-function renderEntry(entry) {
+function renderEntry(entry, convId) {
   const q = `<div class="msg-q">${esc(entry.question)}</div><div class="msg-ctx">${esc(entry.label)}</div>`;
   if (entry.status === 'running') {
     return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>Codex is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
@@ -1612,38 +1732,47 @@ function renderEntry(entry) {
   }
   if (entry.status !== 'done') {
     return q + `<div class="msg-a"><div class="error">${esc(entry.error || entry.status)}</div>
-      <div class="actions"><button type="button" data-retry="${entry.id}">Ask again</button></div></div>`;
+      <div class="actions"><button type="button" data-retry="${convId}:${entry.id}">Ask again</button></div></div>`;
   }
   const r = entry.result;
   const cites = r.citations.length ? `<h4 class="md-h">Citations</h4>${evidenceList(r.citations)}` : '';
   return q + `<div class="msg-a">${mdBlock(r.answer)}${cites}
-    <p class="meta">${fmtDuration(r.duration_ms)} · ${r.commands} commands · ${fmtTokens(r.input_tokens)} in / ${fmtTokens(r.output_tokens)} out tokens</p></div>`;
+    <p class="meta">${fmtDuration(r.duration_ms)} · ${r.commands} commands · ${fmtTokens(r.input_tokens)} in (${fmtTokens(r.cached_input_tokens || 0)} cached) / ${fmtTokens(r.output_tokens)} out tokens</p></div>`;
+}
+
+function updateAskBusy() {
+  $('#ask-busy').hidden = ![mainConv, ...threads].some((c) => c.entries.some((e) => e.status === 'running'));
 }
 
 function renderChat() {
   const chat = $('#chat');
   const stick = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 40;
-  chat.innerHTML = state.chat.length ? state.chat.map(renderEntry).join('') : `<div class="chat-empty">
-    <p>Ask anything about this repository. The question includes what you are looking at:</p>
-    <ul><li>the current map, and the selected component;</li><li>code lines chosen with <b>Ask about selection</b> in the source viewer.</li></ul>
+  const list = threads.length ? `<div class="thread-list"><h4 class="md-h">Code threads</h4><ul class="list">${threads.map((t) => {
+    const last = t.entries[t.entries.length - 1];
+    return `<li class="click" data-open-thread="${t.id}"><a class="loc">${esc(threadLabel(t))}</a>
+      <span class="muted"> · ${t.entries.length} question${t.entries.length === 1 ? '' : 's'}${t.entries.some((e) => e.status === 'running') ? ' · answering…' : ''}</span>
+      ${last ? `<div class="muted">${esc(trunc(last.question, 90))}</div>` : ''}</li>`;
+  }).join('')}</ul></div>` : '';
+  const main = mainConv.entries.length ? mainConv.entries.map((e) => renderEntry(e, 'main')).join('') : `<div class="chat-empty">
+    <p>Ask anything about this repository. The question includes what you are looking at: the current map and the selected component.</p>
+    <p>To ask about code, select lines in the source viewer and use <b>Ask about lines…</b>; the thread opens right under the code.</p>
     <p>Answers cite <code>file:line</code>; click a citation to open it.</p></div>`;
+  chat.innerHTML = list + main;
   if (stick) chat.scrollTop = chat.scrollHeight;
-  $('#ask-busy').hidden = !state.chat.some((e) => e.status === 'running');
+  updateAskBusy();
 }
 
-async function sendQuestion(question, ctxInfo) {
-  const { ctx, label } = ctxInfo || askContext();
-  const history = state.chat.filter((e) => e.status === 'done').map((e) => ({ question: e.question, answer: e.result.answer }));
-  const entry = { id: state.chat.length, question, label, ctx, status: 'running', elapsed: 0, last: '' };
-  state.chat.push(entry);
-  renderChat();
-  $('#chat').scrollTop = $('#chat').scrollHeight;
+/** Ask in a conversation; its session continues once the first answer returns it. */
+async function sendQuestion(conv, question, ctx, label) {
+  const entry = { id: conv.entries.length, question, label, ctx, status: 'running', elapsed: 0, last: '' };
+  conv.entries.push(entry);
+  conv.render();
   try {
-    const res = await post('/api/ask', { question, context: ctx, history });
+    const res = await post('/api/ask', { question, context: ctx, session: conv.session });
     entry.job = res.job;
   } catch (err) {
     Object.assign(entry, { status: 'failed', error: err.message });
-    return renderChat();
+    return conv.render();
   }
   let since = 0;
   const tick = async () => {
@@ -1652,7 +1781,7 @@ async function sendQuestion(question, ctxInfo) {
       job = await api(`/api/job/${entry.job}?since=${since}`);
     } catch (err) {
       Object.assign(entry, { status: 'failed', error: err.message });
-      return renderChat();
+      return conv.render();
     }
     since = job.next;
     const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
@@ -1662,11 +1791,12 @@ async function sendQuestion(question, ctxInfo) {
       setTimeout(tick, 1000);
     } else if (job.status === 'done') {
       Object.assign(entry, { status: 'done', result: job.result });
+      conv.session = job.result.session;
+      if (conv === mainConv) renderAskContext();
     } else {
       Object.assign(entry, { status: job.status, error: job.status === 'cancelled' ? 'Cancelled.' : job.error });
     }
-    if (state.tab === 'ask') renderChat();
-    else $('#ask-busy').hidden = !state.chat.some((e) => e.status === 'running');
+    conv.render();
   };
   tick();
 }
@@ -1674,9 +1804,12 @@ async function sendQuestion(question, ctxInfo) {
 function submitQuestion() {
   const box = $('#question');
   const question = box.value.trim();
-  if (!question) return;
+  // One question at a time keeps the conversation's session linear.
+  if (!question || mainConv.entries.some((e) => e.status === 'running')) return;
   box.value = '';
-  sendQuestion(question);
+  const { ctx, label } = askContext();
+  sendQuestion(mainConv, question, ctx, label);
+  $('#chat').scrollTop = $('#chat').scrollHeight;
 }
 
 $('#ask-send').onclick = submitQuestion;
@@ -1684,16 +1817,29 @@ $('#question').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submitQuestion(); }
 });
 
-$('#chat').addEventListener('click', (e) => {
+/** Citations, cancel and retry inside any conversation. */
+function conversationClick(e) {
   const loc = e.target.closest('[data-src]');
   if (loc) return openSource(loc.dataset.src, Number(loc.dataset.line) || 0);
   const cancel = e.target.closest('[data-cancel]');
   if (cancel) { cancel.disabled = true; return post(`/api/job/${cancel.dataset.cancel}/cancel`).catch(() => {}); }
   const retry = e.target.closest('[data-retry]');
   if (retry) {
-    const old = state.chat[Number(retry.dataset.retry)];
-    sendQuestion(old.question, { ctx: old.ctx, label: old.label });
+    const [convId, n] = retry.dataset.retry.split(':');
+    const conv = convById(convId);
+    const old = conv?.entries[Number(n)];
+    if (old && !conv.entries.some((x) => x.status === 'running')) sendQuestion(conv, old.question, old.ctx, old.label);
   }
+}
+
+$('#chat').addEventListener('click', (e) => {
+  const open = e.target.closest('[data-open-thread]');
+  if (open) {
+    const t = convById(open.dataset.openThread);
+    t.hidden = false;
+    return openSource(t.path, t.start || 0);
+  }
+  conversationClick(e);
 });
 
 window.addEventListener('keydown', (e) => {

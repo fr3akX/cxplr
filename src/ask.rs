@@ -1,20 +1,14 @@
 //! Questions about the code, answered by the agent with the developer's
-//! current view (map, component, selected source lines) as context.
+//! current view (map, component, selected source lines) as context. The first
+//! question of a conversation forks the viewed map's session; follow-ups continue
+//! in that session, so earlier answers are real context, not pasted text.
 
 use crate::map::{Evidence, Map};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt::Write;
 
-const MAX_HISTORY: usize = 6;
-const MAX_HISTORY_ANSWER: usize = 2000;
 const MAX_SELECTION_LINES: usize = 400;
-
-#[derive(Deserialize)]
-pub struct Exchange {
-    pub question: String,
-    pub answer: String,
-}
 
 #[derive(Deserialize, Default)]
 pub struct Context {
@@ -34,8 +28,9 @@ pub struct Request {
     pub question: String,
     #[serde(default)]
     pub context: Context,
+    /// Conversation to continue (returned with the previous answer).
     #[serde(default)]
-    pub history: Vec<Exchange>,
+    pub session: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,12 +64,6 @@ pub fn schema() -> Value {
     })
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    match text.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text.to_owned(),
-    }
-}
 
 /// What the developer is looking at, resolved by the server from the cache and disk.
 pub struct View<'a> {
@@ -85,9 +74,14 @@ pub struct View<'a> {
     pub selection: Option<(String, usize, String)>,
 }
 
-pub fn prompt(repo_name: &str, view: &View, req: &Request) -> String {
-    let mut p = format!(
-        "You are helping a developer understand the repository `{repo_name}` in the current \
+/// A question with what the developer is looking at. Follow-ups skip the
+/// answering instructions, which are already in the session.
+pub fn prompt(repo_name: &str, view: &View, question: &str, follow_up: bool) -> String {
+    let mut p = if follow_up {
+        String::from("Follow-up question; answer as before (Markdown, `path:line` locations, citations).\n")
+    } else {
+        format!(
+            "You are helping a developer understand the repository `{repo_name}` in the current \
 working directory. Investigate with read-only shell commands (rg, sed -n, nl -ba, cat, ls, \
 git log). Do not modify files, install packages, or run the project's code, builds or tests.
 
@@ -100,7 +94,8 @@ question.
 
 Return ONLY the JSON object required by the output schema.
 "
-    );
+        )
+    };
 
     p.push_str("\nWhat the developer is looking at:\n");
     if !view.crumbs.is_empty() {
@@ -126,14 +121,7 @@ Return ONLY the JSON object required by the output schema.
         p.push_str("```\n");
     }
 
-    let history = &req.history[req.history.len().saturating_sub(MAX_HISTORY)..];
-    if !history.is_empty() {
-        p.push_str("\nEarlier in this conversation (oldest first):\n");
-        for ex in history {
-            let _ = writeln!(p, "Q: {}\nA: {}\n", ex.question.trim(), truncate(ex.answer.trim(), MAX_HISTORY_ANSWER));
-        }
-    }
-    let _ = write!(p, "\nQuestion: {}\n", req.question.trim());
+    let _ = write!(p, "\nQuestion: {}\n", question.trim());
     p
 }
 

@@ -1,10 +1,9 @@
 //! Local HTTP API and embedded web UI. Explorations and questions run as
 //! background jobs that the UI polls; source navigation goes through LSP.
 
-use crate::agent;
 use crate::explore::{Explorer, Lineage};
 use crate::lsp::Lsp;
-use crate::{ask, search, trace, verify};
+use crate::{ask, atlas, search, trace, verify};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -14,7 +13,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -26,12 +24,10 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 pub struct AppState {
     ex: Arc<Explorer>,
     lsp: Lsp,
-    ask_schema: PathBuf,
-    trace_schema: PathBuf,
     jobs: Mutex<Jobs>,
 }
 
-/// Handlers use the explorer's repository, cache and agent settings directly.
+/// Handlers use the explorer's repository, cache and Codex sessions directly.
 impl std::ops::Deref for AppState {
     type Target = Explorer;
     fn deref(&self) -> &Explorer {
@@ -74,8 +70,8 @@ impl Job {
 }
 
 impl AppState {
-    pub fn new(ex: Arc<Explorer>, lsp: Lsp, ask_schema: PathBuf, trace_schema: PathBuf) -> Arc<AppState> {
-        Arc::new(AppState { ex, lsp, ask_schema, trace_schema, jobs: Mutex::default() })
+    pub fn new(ex: Arc<Explorer>, lsp: Lsp) -> Arc<AppState> {
+        Arc::new(AppState { ex, lsp, jobs: Mutex::default() })
     }
 
     fn running_job(&self, scope: &str) -> Option<u64> {
@@ -160,7 +156,7 @@ async fn repo_info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "name": st.repo.name,
         "root": st.repo.root,
         "commit": st.repo.head(),
-        "model": st.agent.model,
+        "model": st.codex.model(),
         "cache": st.cache.dir(),
     }))
 }
@@ -225,6 +221,14 @@ async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest
 
 async fn run_job(st: Arc<AppState>, job: Arc<Job>, lineage: Option<Lineage>) {
     let result = st.ex.explore(&job.scope, lineage.as_ref(), &job.cancel, |line| job.push(line)).await;
+    if result.is_ok() {
+        let ex = st.ex.clone();
+        match tokio::task::spawn_blocking(move || atlas::rebuild(&ex.repo, &ex.cache)).await {
+            Ok(Ok(pages)) => job.push(format!("Atlas updated ({pages} pages)")),
+            Ok(Err(e)) => job.push(format!("! atlas not updated: {e}")),
+            Err(e) => job.push(format!("! atlas not updated: {e}")),
+        }
+    }
     st.finish(&job, result.map(|_| None));
 }
 
@@ -291,22 +295,33 @@ async fn answer_question(
     let map = st.cache.load(&st.repo, &req.context.scope).map(|c| c.map);
     let node = map.as_ref().zip(req.context.node.as_ref()).and_then(|(m, id)| m.nodes.iter().find(|n| &n.id == id));
     let crumbs = map.as_ref().and_then(|m| m.meta.as_ref()).map_or_else(|| vec![st.repo.name.clone()], |m| m.crumbs.clone());
+    let mut progress = |line: String| job.push(line);
+    // Follow-ups continue the conversation's session; a new conversation forks the
+    // session of the map being viewed, which has already read that part of the code.
+    let (session, follow_up) = match req.session.clone() {
+        Some(session) => {
+            progress(format!("Continuing conversation in session {session}"));
+            (session, true)
+        }
+        None => {
+            let name = st.session_name(&format!("ask · {}", crumbs.join(" › ")));
+            (st.session_from(Some(&req.context.scope), &name, &mut progress).await?, false)
+        }
+    };
     let view = ask::View { crumbs, map: map.as_ref(), node, selection };
-    let prompt = ask::prompt(&st.repo.name, &view, &req);
-    job.push("Asking codex (read-only sandbox)".into());
+    let prompt = ask::prompt(&st.repo.name, &view, &req.question, follow_up);
     let started = Instant::now();
-    let out = agent::run::<ask::Answer>(&st.agent, &st.repo.root, &st.ask_schema, &prompt, &job.cancel, |line| {
-        job.push(line)
-    })
-    .await?;
+    let out = st.codex.turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
     let mut answer = out.answer;
     verify::verify_citations(&st.repo.root, &mut answer.citations);
     Ok(json!({
         "answer": answer.answer,
         "citations": answer.citations,
+        "session": session,
         "duration_ms": started.elapsed().as_millis() as u64,
         "commands": out.commands,
         "input_tokens": out.input_tokens,
+        "cached_input_tokens": out.cached_input_tokens,
         "output_tokens": out.output_tokens,
     }))
 }
@@ -340,6 +355,7 @@ async fn get_trace(State(st): State<Arc<AppState>>, Query(req): Query<TraceReque
 
 async fn start_trace(State(st): State<Arc<AppState>>, Json(req): Json<TraceRequest>) -> ApiResult {
     let (map, flow, job_key) = trace_target(&st, &req)?;
+    let scope = req.scope.clone();
     let job = {
         let mut jobs = st.jobs.lock().unwrap();
         if let Some(&id) = jobs.running.get(&job_key) {
@@ -351,21 +367,21 @@ async fn start_trace(State(st): State<Arc<AppState>>, Json(req): Json<TraceReque
     };
     let id = job.id;
     tokio::spawn(async move {
-        let result = generate_trace(&st, &job, &map, flow).await;
+        let result = generate_trace(&st, &job, &scope, &map, flow).await;
         st.finish(&job, result.map(Some));
     });
     Ok(Json(json!({ "status": "running", "job": id })))
 }
 
-async fn generate_trace(st: &AppState, job: &Job, map: &crate::map::Map, flow: usize) -> Result<Value, String> {
+async fn generate_trace(st: &AppState, job: &Job, scope: &str, map: &crate::map::Map, flow: usize) -> Result<Value, String> {
     let flow = &map.flows[flow];
-    job.push(format!("Tracing example inputs through “{}” with codex (read-only sandbox)", flow.name));
+    let mut progress = |line: String| job.push(line);
+    progress(format!("Tracing example inputs through “{}” with codex (read-only sandbox)", flow.name));
+    let name = st.session_name(&format!("examples · {}", flow.name));
+    let session = st.session_from(Some(scope), &name, &mut progress).await?;
     let started = Instant::now();
     let prompt = trace::prompt(map, flow);
-    let out = agent::run::<trace::Traces>(&st.agent, &st.repo.root, &st.trace_schema, &prompt, &job.cancel, |line| {
-        job.push(line)
-    })
-    .await?;
+    let out = st.codex.turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
     let mut traces = out.answer;
     traces.diagnostics.clear();
     trace::normalize(&mut traces, map);

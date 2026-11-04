@@ -10,16 +10,19 @@ component for the next level of detail, down to the cited source lines.
 | Component (repeatable) | Internal modules/classes/functions, how they handle the component's interfaces |
 | Source | The exact file and line behind every claim, plus directory browsing |
 
-The exploration is done by [Codex](https://github.com/openai/codex) (`codex exec`)
-running in a read-only sandbox inside the target repository. cxplr builds the
-prompt for each zoom level, constrains the answer to a JSON schema, checks every
-citation against the files on disk, caches the result and serves the UI.
+The exploration is done by [Codex](https://github.com/openai/codex) through a
+long-lived `codex app-server`, in read-only sessions inside the target repository.
+cxplr builds the prompt for each zoom level, constrains the answer to a JSON schema,
+checks every citation against the files on disk, caches the result and serves the
+UI. Sessions form a tree that mirrors the map, so later work starts from what
+earlier explorations already read (see [Codex sessions](#codex-sessions)).
 
 ## Requirements
 
 - Rust toolchain (to build)
-- `codex` on `PATH`, already logged in; the model and reasoning effort come from your
-  Codex config unless `--model` is given
+- `codex` on `PATH`, already logged in, with `codex app-server` (experimental in
+  Codex 0.166; cxplr stops with a clear error if it is missing). The model and
+  reasoning effort come from your Codex config unless `--model` is given
 
 ## Run
 
@@ -56,7 +59,8 @@ the new levels are explored. Raise `--min-lines` to keep the hierarchy coarser.
 
 Other options: `--port`, `--host` (keep loopback; the API serves repository files),
 `--open`, `--model`, `--codex <path>`, `--timeout-mins` (per exploration or question,
-default 20), `--cache-dir`, `--lsp LANG=COMMAND` (repeatable), `--no-lsp`.
+default 20), `--cache-dir`, `--lsp LANG=COMMAND` (repeatable), `--no-lsp`,
+`--forget-sessions`, `--install-skill`.
 
 ## Using the map
 
@@ -143,24 +147,82 @@ cxplr /path/to/repo --lsp "rust=rustup run nightly rust-analyzer"
 
 ## Asking questions
 
-The **Ask** tab sends a question to Codex (same read-only sandbox) together with what
-you are looking at: the current map, the selected component, and code lines chosen
-with **Ask about selection** in the source viewer (whole file if nothing is
-selected). Earlier questions in the conversation are included for follow-ups.
+**About code, inline.** Select lines in the source viewer and click **Ask about
+lines…** (or use **Ask about selection** in the header; without a selection it covers
+the whole file). A thread opens right under the selection, code-review style: ask,
+read the answer, ask follow-ups in place. Each thread is its own conversation and
+stays attached to its lines when you reopen the file.
 
-Answers are Markdown; every `path:line` in them opens the source viewer, and the
-citation list is checked against the files like map evidence. The conversation lives
-in the page and is lost on reload.
+**About the map.** The **Ask** tab sends a question together with the current map and
+the selected component, and lists all code threads (click one to jump to it).
+
+Every conversation's first question forks the session that explored the current map;
+follow-ups continue in that session, so Codex remembers what it read and answered
+(a follow-up typically runs few or no commands, with most input cached). The Ask tab's
+**Conversation** chip shows this; its ✕ starts a new conversation from the map you
+are on. Answers are Markdown; every `path:line` in them opens the source viewer, and
+citations are checked against the files like map evidence. Conversations live in the
+page and are cleared on reload (their Codex sessions remain).
+
+## Atlas and the Codex skill
+
+Every cached map is also written as Markdown to `.cxplr/atlas/`, laid out like the
+map hierarchy, for people and for other agents:
+
+```
+.cxplr/atlas/README.md                 # system: summary, components, interactions, flows
+.cxplr/atlas/<component>/README.md     # one page per explored component
+```
+
+Each page has a **Status** line (fresh, or stale with the changed files), a table of
+components with their paths and links to deeper pages ("not explored" where there is
+none), interactions, data flows and `path:line` citations. The atlas is rebuilt when
+cxplr starts, after indexing and after each exploration from the browser.
+
+```sh
+cxplr --install-skill    # writes $CODEX_HOME/skills/cxplr/SKILL.md (default ~/.codex)
+```
+
+The skill tells any Codex session in a repository with `.cxplr/atlas/README.md` to
+orient from the atlas before exploring: start at the system page, follow links to the
+relevant component, open citations before relying on them, and read the changed files
+of stale pages directly. Codex decides when to load a skill, so this is guidance, not
+enforcement. Re-run `--install-skill` after upgrading cxplr.
+
+## Codex sessions
+
+```mermaid
+flowchart TD
+  S["system map session"] -->|fork| C1["component session"]
+  S -->|fork| C2["component session"]
+  C1 -->|fork| D["deeper component session"]
+  C1 -->|fork| Q["Ask conversation / example inputs"]
+```
+
+- The system map is explored in a new session; each component in a **fork** of the
+  session of the map it appears in, so it starts with its ancestors' exploration
+  already in context (and largely in the provider's prompt cache) while siblings
+  still run in parallel.
+- A stale map is refreshed **inside its own session**: Codex gets the exact list of
+  changed files, re-reads them and returns the updated map, instead of exploring
+  from scratch. If that session no longer exists, it is explored afresh.
+- Questions and example inputs fork the session of the map you are viewing.
+- Sessions are persisted by Codex (forking requires it) and named
+  `cxplr: <repo> › …`, so they appear in `codex resume`; each map shows its session
+  id, and `codex resume <id>` continues it interactively. `--forget-sessions`
+  deletes every session cxplr created for the project (listed in
+  `.cxplr/sessions.json`); cached maps stay, and later work starts new sessions.
 
 ## Trust model
 
 - Maps are model-generated. ✓ on a citation means the file exists inside the
   repository and has that line; it does not prove the claim. `!` marks citations
   that failed the check, and dropped references are listed under Diagnostics.
-- Codex runs with `--sandbox read-only`, approvals off, and hooks, plugins, apps,
-  memories and browser/computer tools disabled. It can still run read-only commands,
-  including scripts in the target repository. A trusted project's `.codex`
-  configuration still applies.
+- Codex sessions run read-only (`sandbox: read-only`), never ask for approval (any
+  request that slips through is declined), with hooks, plugins, apps, memories and
+  browser/computer tools disabled. They can still run read-only commands, including
+  scripts in the target repository. A trusted project's `.codex` configuration
+  still applies.
 - The source endpoint only serves paths that resolve inside the repository; symlinks
   leading outside are refused.
 
