@@ -5,7 +5,7 @@
 //! follow-ups can resume after restarting cxplr, and no transcript descriptors stay open.
 
 use crate::anthropic_wire::Transport;
-use crate::engine::{one_line, Outcome};
+use crate::engine::{one_line, Outcome, Usage};
 use crate::native::{BusySet, Sessions, ANSWER_DESCRIPTION, SYSTEM};
 use crate::repo_tools::Tools;
 use serde_json::{json, Value};
@@ -59,10 +59,10 @@ impl Anthropic {
     }
 
     pub async fn turn(
-        &self, id: &str, prompt: &str, schema: &Value, cancel: &Notify, mut progress: impl FnMut(String),
+        &self, id: &str, prompt: &str, schema: &Value, cancel: &Notify, mut progress: impl FnMut(String), mut on_usage: impl FnMut(Usage),
     ) -> Result<Outcome<Value>, String> {
         let _busy = self.busy.claim(id)?;
-        let run = self.run(id, prompt, schema, &mut progress);
+        let run = self.run(id, prompt, schema, &mut progress, &mut on_usage);
         tokio::select! {
             result = run => result,
             _ = cancel.notified() => Err("cancelled".into()),
@@ -71,7 +71,7 @@ impl Anthropic {
     }
 
     async fn run(
-        &self, id: &str, prompt: &str, schema: &Value, progress: &mut impl FnMut(String),
+        &self, id: &str, prompt: &str, schema: &Value, progress: &mut impl FnMut(String), on_usage: &mut impl FnMut(Usage),
     ) -> Result<Outcome<Value>, String> {
         let validator = jsonschema::validator_for(schema).map_err(|e| format!("invalid answer schema: {e}"))?;
         let mut session = self.sessions.load(id)?;
@@ -79,11 +79,14 @@ impl Anthropic {
         let mut tools = Tools::definitions();
         tools.push(json!({ "name": "_answer", "description": ANSWER_DESCRIPTION, "input_schema": schema }));
         let mut outcome = Outcome { answer: Value::Null, commands: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+        let mut usage = Usage::default();
         loop {
             let reply = self.transport.message(id, SYSTEM, &session.messages, &tools, progress).await?;
-            outcome.input_tokens += reply.input_tokens;
-            outcome.cached_input_tokens += reply.cached_input_tokens;
-            outcome.output_tokens += reply.output_tokens;
+            usage.add_request(reply.input_tokens, reply.cached_input_tokens, reply.output_tokens);
+            on_usage(usage);
+            outcome.input_tokens = usage.input_tokens;
+            outcome.cached_input_tokens = usage.cached_input_tokens;
+            outcome.output_tokens = usage.output_tokens;
             if reply.stop_reason == "max_tokens" {
                 return Err("anthropic response exceeded its output limit before completing the answer".into());
             }

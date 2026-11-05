@@ -1,6 +1,6 @@
 [package]
 name = "cxplr"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 description = "cxplr (Code Explore): learn a repository's architecture top-down, then drill in"
 repository = "https://github.com/fr3akX/cxplr"
@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 futures-util = "0.3.34"
 globset = "0.4.21"
 ignore = "0.4"
+indicatif = "0.18.6"
 jsonschema = { version = "0.60.2", default-features = false }
 regex = "1.13.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "gzip", "brotli", "zstd", "deflate"] }

@@ -9,7 +9,7 @@
 //! servers, and no hooks or other settings from the user's or the repository's
 //! settings files.
 
-use crate::engine::{one_line, Outcome, SESSION_GONE};
+use crate::engine::{one_line, Outcome, Usage, SESSION_GONE};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -162,6 +162,7 @@ impl Claude {
         schema: &Value,
         cancel: &Notify,
         mut progress: impl FnMut(String),
+        mut on_usage: impl FnMut(Usage),
     ) -> Result<Outcome<Value>, String> {
         if !self.busy.lock().unwrap().insert(session.to_owned()) {
             return Err("this session is busy with another turn".into());
@@ -221,7 +222,7 @@ impl Claude {
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
-                    Ok(Some(line)) => state.handle(&line, &self.cwd, &mut progress),
+                    Ok(Some(line)) => state.handle(&line, &self.cwd, &mut progress, &mut on_usage),
                     _ => break,
                 },
                 _ = cancel.notified() => {
@@ -269,10 +270,14 @@ impl Claude {
 struct TurnState {
     result: Option<Value>,
     commands: u32,
+    /// Model requests that are over; the current one is still being streamed.
+    finished: Usage,
+    current: Option<(String, u64, u64, u64)>,
+    context_window: Option<u64>,
 }
 
 impl TurnState {
-    fn handle(&mut self, line: &str, cwd: &Path, progress: &mut impl FnMut(String)) {
+    fn handle(&mut self, line: &str, cwd: &Path, progress: &mut impl FnMut(String), on_usage: &mut impl FnMut(Usage)) {
         let Ok(msg) = serde_json::from_str::<Value>(line) else { return };
         match msg["type"].as_str().unwrap_or_default() {
             "assistant" => {
@@ -298,11 +303,42 @@ impl TurnState {
                         _ => {}
                     }
                 }
+                self.note_usage(&msg["message"], on_usage);
             }
             "system" if msg["subtype"] == "compact_boundary" => progress("… Claude Code compacted the session context".into()),
-            "result" => self.result = Some(msg),
+            "result" => {
+                // The context window is only reported at the end, per model.
+                let windows = msg["modelUsage"].as_object().into_iter().flat_map(|m| m.values()).filter_map(|v| v["contextWindow"].as_u64());
+                self.context_window = windows.max();
+                on_usage(self.usage());
+                self.result = Some(msg);
+            }
             _ => {}
         }
+    }
+
+    /// Every content block of a model reply repeats its usage: count each reply once.
+    fn note_usage(&mut self, message: &Value, on_usage: &mut impl FnMut(Usage)) {
+        let Some(id) = message["id"].as_str() else { return };
+        let u = &message["usage"];
+        let n = |key: &str| u[key].as_u64().unwrap_or(0);
+        let cached = n("cache_read_input_tokens");
+        let input = n("input_tokens") + cached + n("cache_creation_input_tokens");
+        if self.current.as_ref().is_some_and(|(current, ..)| current != id) {
+            let (_, i, c, o) = self.current.take().expect("checked above");
+            self.finished.add_request(i, c, o);
+        }
+        self.current = Some((id.to_owned(), input, cached, n("output_tokens")));
+        on_usage(self.usage());
+    }
+
+    fn usage(&self) -> Usage {
+        let mut usage = self.finished;
+        if let Some((_, i, c, o)) = &self.current {
+            usage.add_request(*i, *c, *o);
+        }
+        usage.context_window = self.context_window;
+        usage
     }
 }
 
@@ -376,22 +412,36 @@ mod tests {
     }
 
     #[test]
-    fn turns_count_exploration_tools_but_not_the_structured_answer() {
+    fn turns_count_tools_and_each_model_reply_once() {
         let cwd = Path::new("/repo");
         let lines = [
             r#"{"type":"system","subtype":"init","session_id":"s"}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/main.rs","offset":10,"limit":40}}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Checking the router."},{"type":"tool_use","name":"Grep","input":{"pattern":"fn route","path":"/repo/src"}}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"StructuredOutput","input":{"value":42}}]}}"#,
-            r#"{"type":"result","subtype":"success","is_error":false,"structured_output":{"value":42}}"#,
+            r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"cache_read_input_tokens":90,"output_tokens":5},"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/main.rs","offset":10,"limit":40}}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":20,"cache_read_input_tokens":180,"output_tokens":3},"content":[{"type":"text","text":"Checking the router."}]}}"#,
+            // The same reply's next block repeats (and updates) its usage.
+            r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":20,"cache_read_input_tokens":180,"output_tokens":9},"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"fn route","path":"/repo/src"}}]}}"#,
+            r#"{"type":"assistant","message":{"id":"m3","usage":{"input_tokens":5,"cache_read_input_tokens":300,"output_tokens":40},"content":[{"type":"tool_use","name":"StructuredOutput","input":{"value":42}}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"structured_output":{"value":42},"modelUsage":{"claude-x":{"contextWindow":200000}}}"#,
         ];
         let mut state = TurnState::default();
-        let mut log = Vec::new();
+        let (mut log, mut seen) = (Vec::new(), Vec::new());
         for line in lines {
-            state.handle(line, cwd, &mut |l| log.push(l));
+            state.handle(line, cwd, &mut |l| log.push(l), &mut |u| seen.push(u));
         }
         assert_eq!(state.commands, 2);
         assert_eq!(log, ["$ Read src/main.rs (lines 10+40)", "› Checking the router.", "$ Grep \"fn route\" src"]);
         assert_eq!(state.result.unwrap()["structured_output"]["value"], 42);
+        let last = seen.last().unwrap();
+        assert_eq!(
+            *last,
+            Usage {
+                requests: 3,
+                input_tokens: 100 + 200 + 305,
+                cached_input_tokens: 90 + 180 + 300,
+                output_tokens: 5 + 9 + 40,
+                context_tokens: 305 + 40,
+                context_window: Some(200_000),
+            }
+        );
     }
 }

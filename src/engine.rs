@@ -49,6 +49,34 @@ pub struct Outcome<T> {
     pub output_tokens: u64,
 }
 
+/// Live token usage of a turn: sums over its model requests so far, reported after
+/// every request while the turn runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Usage {
+    /// Model requests made so far.
+    pub requests: u32,
+    /// Prompt tokens sent, cache hits included.
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    /// Conversation size at the latest request (its prompt plus its reply): how full
+    /// the context window is.
+    pub context_tokens: u64,
+    /// The model's context window, when the engine or server reports it.
+    pub context_window: Option<u64>,
+}
+
+impl Usage {
+    /// Count one model request: `input` includes `cached`.
+    pub fn add_request(&mut self, input: u64, cached: u64, output: u64) {
+        self.requests += 1;
+        self.input_tokens += input;
+        self.cached_input_tokens += cached;
+        self.output_tokens += output;
+        self.context_tokens = input + output;
+    }
+}
+
 pub enum Engine {
     Codex(Arc<Codex>),
     Claude(Arc<Claude>),
@@ -123,12 +151,13 @@ impl Engine {
         schema: &Value,
         cancel: &Notify,
         progress: impl FnMut(String),
+        usage: impl FnMut(Usage),
     ) -> Result<Outcome<T>, String> {
         let out = match self {
-            Engine::Codex(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::Claude(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::Anthropic(c) => c.turn(session, prompt, schema, cancel, progress).await?,
-            Engine::OpenAi(c) => c.turn(session, prompt, schema, cancel, progress).await?,
+            Engine::Codex(c) => c.turn(session, prompt, schema, cancel, progress, usage).await?,
+            Engine::Claude(c) => c.turn(session, prompt, schema, cancel, progress, usage).await?,
+            Engine::Anthropic(c) => c.turn(session, prompt, schema, cancel, progress, usage).await?,
+            Engine::OpenAi(c) => c.turn(session, prompt, schema, cancel, progress, usage).await?,
         };
         let answer = T::deserialize(&out.answer).map_err(|e| {
             format!("{} answer does not match the schema ({e}): {}", self.kind().id(), one_line(&out.answer.to_string(), 400))

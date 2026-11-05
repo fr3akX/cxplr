@@ -3,7 +3,7 @@
 //! Groq, vLLM, llama.cpp, Ollama, LM Studio, …). Histories are stored like native
 //! Anthropic's (see `native.rs`), in OpenAI message format.
 
-use crate::engine::{one_line, Outcome};
+use crate::engine::{one_line, Outcome, Usage};
 use crate::native::{BusySet, Sessions, ANSWER_DESCRIPTION, SYSTEM};
 use crate::repo_tools::Tools;
 use serde::ser::{SerializeSeq, Serializer};
@@ -34,6 +34,8 @@ pub struct OpenAi {
     api_key: Option<String>,
     model: String,
     effort: Option<String>,
+    /// The model's context window, when the server lists it.
+    context_window: Option<u64>,
     tools: Tools,
     sessions: Sessions,
     timeout: Duration,
@@ -123,16 +125,20 @@ impl OpenAi {
             .connect_timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("HTTP client: {e}"))?;
+        let listed = models(&client, &base, cfg.api_key.as_deref()).await;
         let model = match cfg.model {
             Some(model) => model,
-            None => only_model(&client, &base, cfg.api_key.as_deref()).await?,
+            None => only_model(&base, &listed)?,
         };
+        // Best effort: servers that list the window (llama.cpp, OpenRouter, vLLM).
+        let context_window = listed.ok().and_then(|ms| ms.into_iter().find(|m| m.id == model)).and_then(|m| m.context_window);
         Ok(Self {
             client,
             endpoint: format!("{base}/chat/completions"),
             api_key: cfg.api_key,
             model,
             effort: cfg.effort,
+            context_window,
             tools: Tools::new(root)?,
             sessions: Sessions::new(root, cache, "openai-sessions")?,
             timeout: cfg.timeout,
@@ -170,9 +176,10 @@ impl OpenAi {
         schema: &Value,
         cancel: &Notify,
         mut progress: impl FnMut(String),
+        mut on_usage: impl FnMut(Usage),
     ) -> Result<Outcome<Value>, String> {
         let _busy = self.busy.claim(id)?;
-        let run = self.run(id, prompt, schema, &mut progress);
+        let run = self.run(id, prompt, schema, &mut progress, &mut on_usage);
         tokio::select! {
             result = run => result,
             _ = cancel.notified() => Err("cancelled".into()),
@@ -207,19 +214,30 @@ impl OpenAi {
         serde_json::from_str(&text).map_err(|e| format!("{} did not return JSON ({e}): {}", self.endpoint, one_line(&text, 300)))
     }
 
-    async fn run(&self, id: &str, prompt: &str, schema: &Value, progress: &mut impl FnMut(String)) -> Result<Outcome<Value>, String> {
+    async fn run(
+        &self,
+        id: &str,
+        prompt: &str,
+        schema: &Value,
+        progress: &mut impl FnMut(String),
+        on_usage: &mut impl FnMut(Usage),
+    ) -> Result<Outcome<Value>, String> {
         let validator = jsonschema::validator_for(schema).map_err(|e| format!("invalid answer schema: {e}"))?;
         let mut session = self.sessions.load(id)?;
         session.messages.push(json!({ "role": "user", "content": prompt }));
         let tools = function_tools(schema);
         let mut outcome = Outcome { answer: Value::Null, commands: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 };
+        let mut usage = Usage { context_window: self.context_window, ..Usage::default() };
         let mut nudges = 0;
         loop {
             let reply = self.complete(&session.messages, &tools).await?;
-            let usage = &reply["usage"];
-            outcome.input_tokens += usage["prompt_tokens"].as_u64().unwrap_or(0);
-            outcome.cached_input_tokens += usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-            outcome.output_tokens += usage["completion_tokens"].as_u64().unwrap_or(0);
+            let u = &reply["usage"];
+            let n = |v: &Value| v.as_u64().unwrap_or(0);
+            usage.add_request(n(&u["prompt_tokens"]), n(&u["prompt_tokens_details"]["cached_tokens"]), n(&u["completion_tokens"]));
+            on_usage(usage);
+            outcome.input_tokens = usage.input_tokens;
+            outcome.cached_input_tokens = usage.cached_input_tokens;
+            outcome.output_tokens = usage.output_tokens;
             let choice = &reply["choices"][0];
             let message = &choice["message"];
             if !message.is_object() {
@@ -296,8 +314,15 @@ impl OpenAi {
     }
 }
 
-/// The model ids `<base>/models` lists.
-async fn models(client: &reqwest::Client, base: &str, key: Option<&str>) -> Result<Vec<String>, String> {
+/// One entry of `<base>/models`.
+struct Listed {
+    id: String,
+    context_window: Option<u64>,
+}
+
+/// The models `<base>/models` lists, with their context window where the server
+/// says (llama.cpp `meta.n_ctx`, OpenRouter `context_length`, vLLM `max_model_len`).
+async fn models(client: &reqwest::Client, base: &str, key: Option<&str>) -> Result<Vec<Listed>, String> {
     let mut req = client.get(format!("{base}/models"));
     if let Some(key) = key {
         req = req.bearer_auth(key);
@@ -308,23 +333,32 @@ async fn models(client: &reqwest::Client, base: &str, key: Option<&str>) -> Resu
     if !status.is_success() {
         return Err(format!("{base}/models returned {status}"));
     }
-    Ok(body["data"].as_array().into_iter().flatten().filter_map(|m| m["id"].as_str().map(str::to_owned)).collect())
+    Ok(body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m["id"].as_str()?.to_owned();
+            let context_window = m["meta"]["n_ctx"].as_u64().or(m["context_length"].as_u64()).or(m["max_model_len"].as_u64());
+            Some(Listed { id, context_window })
+        })
+        .collect())
 }
 
 /// The models a server offers, for `--configure`; `base_url` as the user wrote it.
 pub async fn list_models(base_url: &str, key: Option<&str>) -> Result<Vec<String>, String> {
     let base = api_base(base_url)?;
     let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).timeout(Duration::from_secs(20)).build().map_err(|e| e.to_string())?;
-    models(&client, &base, key).await
+    Ok(models(&client, &base, key).await?.into_iter().map(|m| m.id).collect())
 }
 
 /// The model of a server that serves exactly one (typical for local servers).
-async fn only_model(client: &reqwest::Client, base: &str, key: Option<&str>) -> Result<String, String> {
-    let ids = models(client, base, key).await.map_err(|e| format!("{e}; pass --model"))?;
+fn only_model(base: &str, listed: &Result<Vec<Listed>, String>) -> Result<String, String> {
+    let ids: Vec<&str> = listed.as_ref().map_err(|e| format!("{e}; pass --model"))?.iter().map(|m| m.id.as_str()).collect();
     match ids.as_slice() {
-        [one] => Ok(one.clone()),
+        [one] => Ok((*one).to_owned()),
         [] => Err(format!("{base} lists no models; pass --model")),
-        many => Err(format!("{base} serves {} models; choose one with --model: {}", many.len(), many.iter().take(12).cloned().collect::<Vec<_>>().join(", "))),
+        many => Err(format!("{base} serves {} models; choose one with --model: {}", many.len(), many.iter().take(12).copied().collect::<Vec<_>>().join(", "))),
     }
 }
 

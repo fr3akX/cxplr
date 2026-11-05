@@ -8,7 +8,7 @@
 //! model is set: then they start a session seeded with the atlas instead.
 
 use crate::cache::{Cache, Freshness};
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, Usage};
 use crate::map::{self, Map, Meta, Node};
 use crate::repo::Repo;
 use crate::{atlas, prompt, verify};
@@ -147,6 +147,7 @@ impl Explorer {
         lineage: Option<&Lineage>,
         cancel: &Notify,
         mut progress: impl FnMut(String),
+        mut usage: impl FnMut(Usage),
     ) -> Result<Map, String> {
         let (full_prompt, mut crumbs, paths) = match lineage {
             None => (prompt::system(&self.repo.name), vec![self.repo.name.clone()], vec![".".to_owned()]),
@@ -182,13 +183,13 @@ impl Explorer {
         };
 
         let started = Instant::now();
-        let (session, refreshed, out) = match self.engine.turn::<Map>(&session, &prompt, &map::schema(), cancel, &mut progress).await {
+        let (session, refreshed, out) = match self.engine.turn::<Map>(&session, &prompt, &map::schema(), cancel, &mut progress, &mut usage).await {
             Ok(out) => (session, refreshed, out),
             // The map's session no longer exists (deleted): explore from scratch instead.
             Err(e) if refreshed && e.starts_with(engine::SESSION_GONE) => {
                 progress(format!("! session {session} is gone ({e}); exploring from scratch"));
                 let fresh = self.session_from(parent_scope(scope), &name, &mut progress).await?;
-                let out = self.engine.turn::<Map>(&fresh, &full_prompt, &map::schema(), cancel, &mut progress).await?;
+                let out = self.engine.turn::<Map>(&fresh, &full_prompt, &map::schema(), cancel, &mut progress, &mut usage).await?;
                 (fresh, false, out)
             }
             Err(e) => return Err(e),

@@ -1,6 +1,7 @@
 //! Local HTTP API and embedded web UI. Explorations and questions run as
 //! background jobs that the UI polls; source navigation goes through LSP.
 
+use crate::engine::Usage;
 use crate::explore::{Explorer, Lineage};
 use crate::lsp::Lsp;
 use crate::{ask, atlas, search, trace, verify, walk};
@@ -58,6 +59,8 @@ struct JobInner {
     progress: Vec<String>,
     error: Option<String>,
     result: Option<Value>,
+    /// Token usage of the engine turn running now (or last).
+    usage: Option<Usage>,
 }
 
 impl Job {
@@ -66,6 +69,10 @@ impl Job {
         if inner.progress.len() < MAX_PROGRESS {
             inner.progress.push(line);
         }
+    }
+
+    fn set_usage(&self, usage: Usage) {
+        self.inner.lock().unwrap().usage = Some(usage);
     }
 }
 
@@ -87,7 +94,7 @@ impl AppState {
             scope,
             cancel: Notify::new(),
             started: Instant::now(),
-            inner: Mutex::new(JobInner { status: "running", progress: Vec::new(), error: None, result: None }),
+            inner: Mutex::new(JobInner { status: "running", progress: Vec::new(), error: None, result: None, usage: None }),
         });
         jobs.by_id.insert(job.id, job.clone());
         job
@@ -229,7 +236,7 @@ async fn explore(State(st): State<Arc<AppState>>, Json(req): Json<ExploreRequest
 }
 
 async fn run_job(st: Arc<AppState>, job: Arc<Job>, lineage: Option<Lineage>) {
-    let result = st.ex.explore(&job.scope, lineage.as_ref(), &job.cancel, |line| job.push(line)).await;
+    let result = st.ex.explore(&job.scope, lineage.as_ref(), &job.cancel, |line| job.push(line), |u| job.set_usage(u)).await;
     if result.is_ok() {
         let ex = st.ex.clone();
         match tokio::task::spawn_blocking(move || atlas::rebuild(&ex.repo, &ex.cache)).await {
@@ -264,6 +271,7 @@ async fn job_status(
         "result": inner.result,
         "progress": inner.progress[from..],
         "next": inner.progress.len(),
+        "usage": inner.usage,
         "elapsed_ms": job.started.elapsed().as_millis() as u64,
     })))
 }
@@ -322,7 +330,7 @@ async fn answer_question(
     let view = ask::View { crumbs, map: map.as_ref(), node, selection };
     let prompt = atlas::seeded(context, ask::prompt(&st.repo.name, &view, &req.question, follow_up));
     let started = Instant::now();
-    let out = st.ask_engine().turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
+    let out = st.ask_engine().turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress, |u| job.set_usage(u)).await?;
     let mut answer = out.answer;
     verify::verify_citations(&st.repo.root, &mut answer.citations);
     Ok(json!({
@@ -392,7 +400,7 @@ async fn generate_trace(st: &AppState, job: &Job, scope: &str, map: &crate::map:
     let (session, context) = st.ask_session(scope, &name, &mut progress).await?;
     let started = Instant::now();
     let prompt = atlas::seeded(context, trace::prompt(map, flow));
-    let out = st.ask_engine().turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
+    let out = st.ask_engine().turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress, |u| job.set_usage(u)).await?;
     let mut traces = out.answer;
     traces.diagnostics.clear();
     trace::normalize(&mut traces, map);
@@ -486,7 +494,7 @@ async fn generate_walk(
     let (session, context) = st.ask_session(scope, &name, &mut progress).await?;
     let started = Instant::now();
     let prompt = atlas::seeded(context, walk::prompt(map, flow, scenario));
-    let out = st.ask_engine().turn::<walk::Walk>(&session, &prompt, &walk::schema(), &job.cancel, &mut progress).await?;
+    let out = st.ask_engine().turn::<walk::Walk>(&session, &prompt, &walk::schema(), &job.cancel, &mut progress, |u| job.set_usage(u)).await?;
     let mut walk = out.answer;
     walk::verify(&st.repo.root, &mut walk);
     if walk.steps.is_empty() {

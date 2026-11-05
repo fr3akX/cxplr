@@ -6,8 +6,9 @@ cited source lines, in a local web UI.
 
 - **Maps at every level**: system, component, sub-component…, each with interactions,
   data flows and `file:line` evidence checked against the code.
-- **Full-project indexing** up front (`--index`), then browsing straight from a
-  content-addressed cache that survives commits.
+- **Full-project indexing** up front (`--index`), with a live progress bar and model
+  stats (tokens, cache share, context used of the window) per running exploration, then
+  browsing straight from a content-addressed cache that survives commits.
 - **Simulation**: watch N inputs travel a data flow; generate concrete example inputs
   that take different branches, with the data at every step.
 - **Code walkthrough**: step forward and back (or autoplay) through the code one example
@@ -252,7 +253,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.11.0 is available (you have 0.10.0): run `cxplr --update`
+cxplr 0.12.0 is available (you have 0.11.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -267,8 +268,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.11.0"
-git tag v0.11.0 && git push origin main v0.11.0
+cargo build && git commit -am "Release 0.12.0"
+git tag v0.12.0 && git push origin main v0.12.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -302,6 +303,29 @@ interruption (Ctrl-C keeps finished maps) or a commit explores only what is miss
 changed. A common pattern is to index at depth 2 and deepen later; cached levels are
 reused. For reference, `sre-agent` (≈850 files) indexed at depth 2 in about 16 minutes
 with 9 explorations and 3.5M input tokens.
+
+In a terminal, indexing shows a live display; finished maps print above it:
+
+```
+  ✓ cxplr — Code Explore › Browser exploration UI (1m12s, 10 nodes, 119k in (62% cached) / 3k out tokens) [2 queued, 2 running]
+████▏                        1/7 maps · 84s · 3 running · 3 queued · 226k in (37% cached) / 3k out
+  ⠦ cxplr CLI and lifecycle 9s · 1 calls · ctx 35k/475k (7%) · 35k in (0% cached) / 81 out · $ nl -ba src/main.rs
+  ⠦ Browser exploration UI 9s · 1 calls · ctx 35k/475k (7%) · 35k in (0% cached) / 128 out · $ rg -n "fetch" web
+```
+
+- **Bar:** maps done out of those found so far (the total grows as deeper components are
+  discovered), elapsed time, running and queued explorations, and token totals for the
+  whole run, including the running ones.
+- **One line per running exploration:** elapsed time, tool calls, the context in use
+  against the model's window (`ctx`), tokens so far with the share served from the
+  prompt cache, and the latest step.
+
+Context is the size of the conversation at the latest model request. The window comes
+from the engine: Codex reports it, Claude Code at the end of a turn, and OpenAI-compatible
+servers when their model list includes it (llama.cpp, OpenRouter, vLLM); otherwise only
+the size is shown. Without a terminal (pipes, CI), indexing prints plain lines as before.
+The same live figures appear in the web UI while a map is explored and while a question,
+example run or walkthrough runs, with a meter for the context window.
 
 A component becomes a leaf when it is not explorable, is an external system or actor,
 has fewer than `--min-lines` lines, or covers no fewer files than the map it appears

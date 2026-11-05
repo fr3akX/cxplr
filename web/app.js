@@ -78,6 +78,18 @@ function fmtTokens(n) {
   return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
 }
 
+/** A running job's live model stats: context use against the window, tokens, requests. */
+function usageHtml(u) {
+  if (!u?.requests) return '';
+  const pct = u.context_window ? Math.min(100, Math.round((u.context_tokens * 100) / u.context_window)) : null;
+  const ctx = pct === null
+    ? `context ${fmtTokens(u.context_tokens)}`
+    : `context ${fmtTokens(u.context_tokens)} / ${fmtTokens(u.context_window)} (${pct}%)`;
+  const cached = u.input_tokens ? ` (${Math.round((u.cached_input_tokens * 100) / u.input_tokens)}% cached)` : '';
+  const meter = pct === null ? '' : `<span class="ctx-meter" title="Context window used"><span style="width:${pct}%"></span></span>`;
+  return `<div class="usage">${meter}<span>${ctx} · ${fmtTokens(u.input_tokens)} in${cached} / ${fmtTokens(u.output_tokens)} out · ${u.requests} request${u.requests === 1 ? '' : 's'}</span></div>`;
+}
+
 const nodeById = (id) => state.map?.nodes.find((n) => n.id === id);
 const childScope = (id) => (state.scope ? `${state.scope}/${id}` : id);
 
@@ -175,6 +187,7 @@ function watch(jobId, scope) {
   showScreen(`
     <div class="row"><div class="spinner"></div><h2>Exploring ${esc(label)}</h2></div>
     <div class="muted">${esc(engineName())} is reading the repository (read-only). <span id="elapsed"></span></div>
+    <div id="job-usage"></div>
     <pre class="log" id="log"></pre>
     <div class="row"><button id="cancel" type="button">Cancel</button></div>`);
   renderPanelNote(`Exploration in progress. The map appears here when ${engineName()} finishes and its citations are verified.`);
@@ -201,6 +214,8 @@ function watch(jobId, scope) {
     if (stick) log.scrollTop = log.scrollHeight;
     const el = $('#elapsed');
     if (el) el.textContent = `Elapsed ${fmtDuration(job.elapsed_ms)}.`;
+    const usage = $('#job-usage');
+    if (usage) usage.innerHTML = usageHtml(job.usage);
     if (job.status === 'running') state.poll = setTimeout(tick, 1000);
     else if (job.status === 'done') load(scope);
     else if (job.status === 'cancelled') showError('Exploration cancelled.', scope);
@@ -1102,7 +1117,7 @@ function renderTraceBox(t) {
   }
   if (t.status === 'running') {
     box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
-      <button type="button" data-trace-cancel>Cancel</button></div>${t.last ? `<div class="last">${esc(t.last)}</div>` : ''}</div>`;
+      <button type="button" data-trace-cancel>Cancel</button></div>${usageHtml(t.usage)}${t.last ? `<div class="last">${esc(t.last)}</div>` : ''}</div>`;
     return;
   }
   const { scenarios, meta, diagnostics } = t.traces;
@@ -1143,6 +1158,7 @@ function pollTrace(id, t) {
     const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
     if (lines.length) t.last = lines[lines.length - 1];
     t.elapsed = job.elapsed_ms;
+    t.usage = job.usage;
     if (job.status === 'running') setTimeout(tick, 1000);
     else if (job.status === 'done') Object.assign(t, { status: 'ready', traces: job.result });
     else Object.assign(t, { status: job.status, error: job.status === 'cancelled' ? '' : job.error });
@@ -1227,7 +1243,7 @@ function renderWalkStatus(k) {
   const w = walkState.get(walkId(k));
   if (w?.status === 'running') {
     el.innerHTML = `<div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is walking the code… ${fmtDuration(w.elapsed || 0)}</span>
-      <button type="button" data-walk-cancel="${k}">Cancel</button></div>${w.last ? `<div class="last">${esc(w.last)}</div>` : ''}`;
+      <button type="button" data-walk-cancel="${k}">Cancel</button></div>${usageHtml(w.usage)}${w.last ? `<div class="last">${esc(w.last)}</div>` : ''}`;
     return;
   }
   const ready = w?.status === 'ready';
@@ -1276,6 +1292,7 @@ function pollWalk(id, k, w) {
     const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
     if (lines.length) w.last = lines[lines.length - 1];
     w.elapsed = job.elapsed_ms;
+    w.usage = job.usage;
     if (job.status === 'running') setTimeout(tick, 1000);
     else if (job.status === 'done') Object.assign(w, { status: 'ready', walk: job.result });
     else Object.assign(w, { status: job.status === 'cancelled' ? 'missing' : 'failed', error: job.error });
@@ -2686,7 +2703,7 @@ function renderEntry(entry, convId) {
   const q = `<div class="msg-q">${esc(entry.question)}</div><div class="msg-ctx">${esc(entry.label)}</div>`;
   if (entry.status === 'running') {
     return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
-      <button type="button" data-cancel="${entry.job}">Cancel</button></div>${entry.last ? `<div class="last">${esc(entry.last)}</div>` : ''}</div>`;
+      <button type="button" data-cancel="${entry.job}">Cancel</button></div>${usageHtml(entry.usage)}${entry.last ? `<div class="last">${esc(entry.last)}</div>` : ''}</div>`;
   }
   if (entry.status !== 'done') {
     return q + `<div class="msg-a"><div class="error">${esc(entry.error || entry.status)}</div>
@@ -2745,6 +2762,7 @@ async function sendQuestion(conv, question, ctx, label) {
     const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
     if (lines.length) entry.last = lines[lines.length - 1];
     entry.elapsed = job.elapsed_ms;
+    entry.usage = job.usage;
     if (job.status === 'running') {
       setTimeout(tick, 1000);
     } else if (job.status === 'done') {

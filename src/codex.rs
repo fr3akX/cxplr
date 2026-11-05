@@ -3,7 +3,7 @@
 //! Sessions are persisted Codex threads, read-only, that never ask for approval
 //! and are named `cxplr: …` in the Codex session list.
 
-use crate::engine::{one_line, Outcome, SESSION_GONE};
+use crate::engine::{one_line, Outcome, Usage, SESSION_GONE};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -286,6 +286,7 @@ impl Codex {
         schema: &Value,
         cancel: &Notify,
         mut progress: impl FnMut(String),
+        mut on_usage: impl FnMut(Usage),
     ) -> Result<Outcome<Value>, String> {
         self.ensure_loaded(thread).await?;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -319,7 +320,7 @@ impl Codex {
                     let Some(msg) = msg else {
                         return Err(self.exited.lock().unwrap().clone().unwrap_or_else(|| "codex app-server stopped".into()));
                     };
-                    if let Some(done) = state.handle(&msg, &turn_id, &mut progress) {
+                    if let Some(done) = state.handle(&msg, &turn_id, &mut progress, &mut on_usage) {
                         done?;
                         break;
                     }
@@ -342,9 +343,9 @@ impl Codex {
         Ok(Outcome {
             answer,
             commands: state.commands,
-            input_tokens: state.input_tokens,
-            cached_input_tokens: state.cached_input_tokens,
-            output_tokens: state.output_tokens,
+            input_tokens: state.usage.input_tokens,
+            cached_input_tokens: state.usage.cached_input_tokens,
+            output_tokens: state.usage.output_tokens,
         })
     }
 }
@@ -354,14 +355,12 @@ struct TurnState {
     last_message: Option<String>,
     last_error: Option<String>,
     commands: u32,
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    output_tokens: u64,
+    usage: Usage,
 }
 
 impl TurnState {
     /// `Some(result)` once the turn is over.
-    fn handle(&mut self, msg: &Value, turn_id: &str, progress: &mut impl FnMut(String)) -> Option<Result<(), String>> {
+    fn handle(&mut self, msg: &Value, turn_id: &str, progress: &mut impl FnMut(String), on_usage: &mut impl FnMut(Usage)) -> Option<Result<(), String>> {
         let p = &msg["params"];
         if p["turnId"].as_str().is_some_and(|t| t != turn_id) {
             return None;
@@ -391,10 +390,15 @@ impl TurnState {
             },
             // `last` is one model request; summing them gives the turn's usage.
             "thread/tokenUsage/updated" => {
-                let last = &p["tokenUsage"]["last"];
-                self.input_tokens += last["inputTokens"].as_u64().unwrap_or(0);
-                self.cached_input_tokens += last["cachedInputTokens"].as_u64().unwrap_or(0);
-                self.output_tokens += last["outputTokens"].as_u64().unwrap_or(0);
+                let usage = &p["tokenUsage"];
+                let n = |v: &Value, key: &str| v[key].as_u64().unwrap_or(0);
+                let last = &usage["last"];
+                self.usage.add_request(n(last, "inputTokens"), n(last, "cachedInputTokens"), n(last, "outputTokens"));
+                if let Some(total) = last["totalTokens"].as_u64() {
+                    self.usage.context_tokens = total;
+                }
+                self.usage.context_window = usage["modelContextWindow"].as_u64().or(self.usage.context_window);
+                on_usage(self.usage);
             }
             // Transient errors (reconnects) are retried by Codex and only reported.
             "error" => {
