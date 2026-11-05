@@ -20,6 +20,7 @@ mod skill;
 mod trace;
 mod update;
 mod verify;
+mod walk;
 
 use clap::Parser;
 use std::path::PathBuf;

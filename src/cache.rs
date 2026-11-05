@@ -10,6 +10,8 @@
 //!   served, marked stale with exactly which files changed, until it is refreshed.
 //! - `traces/<key>.json`: example inputs for one flow, keyed by the scope's content
 //!   key and the flow name.
+//! - `walks/<key>.json`: the code walkthrough of one example input, keyed by its
+//!   flow's trace key and the example.
 //! - `sessions.json` (Codex), `sessions-claude.json`, `sessions-anthropic.json`:
 //!   sessions cxplr created (id → name), deleted with `--forget-sessions`.
 
@@ -81,6 +83,7 @@ impl Cache {
         fs::create_dir_all(dir.join("maps"))?;
         fs::create_dir_all(dir.join("scopes"))?;
         fs::create_dir_all(dir.join("traces"))?;
+        fs::create_dir_all(dir.join("walks"))?;
         let ignore = dir.join(".gitignore");
         if !ignore.exists() {
             fs::write(ignore, "# cxplr cache: local only\n*\n")?;
@@ -222,6 +225,21 @@ impl Cache {
 
     pub fn store_trace(&self, key: &str, traces: &crate::trace::Traces) -> io::Result<()> {
         write_atomic(&self.dir.join("traces").join(format!("{key}.json")), &serde_json::to_vec_pretty(traces)?)
+    }
+
+    /// Key for the code walkthrough of one example of a flow; changes with the code.
+    pub fn walk_key(&self, repo: &Repo, scope: &str, flow: &str, scenario: &crate::trace::Scenario) -> Option<String> {
+        let trace = self.trace_key(repo, scope, flow)?;
+        let text = format!("{trace}\nwalk {}\n{}\n{}", crate::walk::VERSION, scenario.name, scenario.input);
+        Some(digest(&text)[..32].to_owned())
+    }
+
+    pub fn load_walk(&self, key: &str) -> Option<crate::walk::Walk> {
+        serde_json::from_slice(&fs::read(self.dir.join("walks").join(format!("{key}.json"))).ok()?).ok()
+    }
+
+    pub fn store_walk(&self, key: &str, walk: &crate::walk::Walk) -> io::Result<()> {
+        write_atomic(&self.dir.join("walks").join(format!("{key}.json")), &serde_json::to_vec_pretty(walk)?)
     }
 }
 

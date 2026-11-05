@@ -3,7 +3,7 @@
 
 use crate::explore::{Explorer, Lineage};
 use crate::lsp::Lsp;
-use crate::{ask, atlas, search, trace, verify};
+use crate::{ask, atlas, search, trace, verify, walk};
 use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -132,6 +132,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/explore", post(explore))
         .route("/api/ask", post(ask_question))
         .route("/api/trace", get(get_trace).post(start_trace))
+        .route("/api/walk", get(get_walk).post(start_walk))
         .route("/api/job/{id}", get(job_status))
         .route("/api/job/{id}/cancel", post(cancel_job))
         .route("/api/source", get(source))
@@ -400,6 +401,101 @@ async fn generate_trace(st: &AppState, job: &Job, scope: &str, map: &crate::map:
     });
     st.cache.store_trace(&job.scope["trace:".len()..], &traces).map_err(|e| format!("saving traces: {e}"))?;
     serde_json::to_value(&traces).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+struct WalkRequest {
+    #[serde(default)]
+    scope: String,
+    /// Index into the scope's map flows.
+    flow: usize,
+    /// Index into the flow's cached example inputs.
+    scenario: usize,
+}
+
+/// What a walkthrough request is about.
+struct WalkTarget {
+    map: crate::map::Map,
+    flow: usize,
+    scenario: trace::Scenario,
+    job_key: String,
+}
+
+/// The example inputs must be cached: the walkthrough follows one of them.
+fn walk_target(st: &AppState, req: &WalkRequest) -> Result<WalkTarget, (StatusCode, Json<Value>)> {
+    let map = st.cache.load(&st.repo, &req.scope).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this map is not cached"))?.map;
+    let flow = map.flows.get(req.flow).ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such flow"))?;
+    let trace_key = st.cache.trace_key(&st.repo, &req.scope, &flow.name).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this map is not cached"))?;
+    let traces = st.cache.load_trace(&trace_key).ok_or_else(|| fail(StatusCode::NOT_FOUND, "generate example inputs for this flow first"))?;
+    let scenario = traces.scenarios.get(req.scenario).cloned().ok_or_else(|| fail(StatusCode::NOT_FOUND, "no such example input"))?;
+    let key = st.cache.walk_key(&st.repo, &req.scope, &flow.name, &scenario).ok_or_else(|| fail(StatusCode::NOT_FOUND, "this map is not cached"))?;
+    Ok(WalkTarget { map, flow: req.flow, scenario, job_key: format!("walk:{key}") })
+}
+
+async fn get_walk(State(st): State<Arc<AppState>>, Query(req): Query<WalkRequest>) -> ApiResult {
+    let job_key = walk_target(&st, &req)?.job_key;
+    if let Some(job) = st.running_job(&job_key) {
+        return Ok(Json(json!({ "status": "running", "job": job })));
+    }
+    Ok(Json(match st.cache.load_walk(&job_key["walk:".len()..]) {
+        Some(walk) => json!({ "status": "ready", "walk": walk }),
+        None => json!({ "status": "missing" }),
+    }))
+}
+
+async fn start_walk(State(st): State<Arc<AppState>>, Json(req): Json<WalkRequest>) -> ApiResult {
+    let WalkTarget { map, flow, scenario, job_key } = walk_target(&st, &req)?;
+    let scope = req.scope.clone();
+    let job = {
+        let mut jobs = st.jobs.lock().unwrap();
+        if let Some(&id) = jobs.running.get(&job_key) {
+            return Ok(Json(json!({ "status": "running", "job": id })));
+        }
+        let job = AppState::new_job(&mut jobs, "walk", job_key.clone());
+        jobs.running.insert(job_key, job.id);
+        job
+    };
+    let id = job.id;
+    tokio::spawn(async move {
+        let result = generate_walk(&st, &job, &scope, &map, flow, &scenario).await;
+        st.finish(&job, result.map(Some));
+    });
+    Ok(Json(json!({ "status": "running", "job": id })))
+}
+
+async fn generate_walk(
+    st: &AppState,
+    job: &Job,
+    scope: &str,
+    map: &crate::map::Map,
+    flow: usize,
+    scenario: &trace::Scenario,
+) -> Result<Value, String> {
+    let flow = &map.flows[flow];
+    let mut progress = |line: String| job.push(line);
+    progress(format!("Walking “{}” through the code with {} (read-only)", scenario.name, st.engine.kind().id()));
+    let name = st.session_name(&format!("walkthrough · {} · {}", flow.name, scenario.name));
+    let session = st.session_from(Some(scope), &name, &mut progress).await?;
+    let started = Instant::now();
+    let prompt = walk::prompt(map, flow, scenario);
+    let out = st.engine.turn::<walk::Walk>(&session, &prompt, &walk::schema(), &job.cancel, &mut progress).await?;
+    let mut walk = out.answer;
+    walk::verify(&st.repo.root, &mut walk);
+    if walk.steps.is_empty() {
+        return Err(format!("{} returned no steps for this example", st.engine.kind().id()));
+    }
+    walk.meta = Some(walk::WalkMeta {
+        flow: flow.name.clone(),
+        scenario: scenario.name.clone(),
+        input: scenario.input.clone(),
+        generated_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+        duration_ms: started.elapsed().as_millis() as u64,
+        commands: out.commands,
+        input_tokens: out.input_tokens,
+        output_tokens: out.output_tokens,
+    });
+    st.cache.store_walk(&job.scope["walk:".len()..], &walk).map_err(|e| format!("saving the walkthrough: {e}"))?;
+    serde_json::to_value(&walk).map_err(|e| e.to_string())
 }
 
 async fn cancel_job(State(st): State<Arc<AppState>>, UrlPath(id): UrlPath<u64>) -> ApiResult {

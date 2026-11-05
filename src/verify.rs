@@ -39,6 +39,16 @@ fn count_lines(bytes: &[u8]) -> usize {
     newlines + usize::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
+/// A file's repository-relative path and its number of lines.
+pub fn file_lines(root: &Path, raw: &str) -> Result<(String, usize), String> {
+    let (full, shown) = resolve(root, raw)?;
+    if !full.is_file() {
+        return Err("not a readable file".into());
+    }
+    let bytes = fs::read(&full).map_err(|_| "not a readable file".to_string())?;
+    Ok((shown, count_lines(&bytes)))
+}
+
 struct Verifier<'a> {
     root: &'a Path,
     lines: HashMap<PathBuf, Option<usize>>,

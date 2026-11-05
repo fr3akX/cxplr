@@ -231,6 +231,27 @@ Simulations run on any map that has data flows, from the **Details** tab:
 
 Simulation shows paths and data, not timing or throughput.
 
+### Code walkthrough
+
+Step through the code one example input actually runs, like a debugger you move by hand:
+
+1. Generate example inputs for a flow (above), then click **Walk through code** under one
+   of them. The engine (read-only, about 1–3 minutes) follows that input from where it
+   enters the repository to its outcome: 8–40 steps, each a line range with what happens
+   there, which way a branch goes and why, and the concrete values at that point. Every
+   range is checked against the files; the result is cached, and the button then reads
+   **Step through code · N steps**.
+2. The source viewer docks to the right so the map stays visible. Each step opens its
+   file in a tab, highlights its lines and shows a note under them; the map lights up
+   the component whose paths contain the file and pulses it when the walk enters a new
+   one (the bar shows its name). The component is worked out from the file path, so this
+   also works after zooming into a component's own map.
+3. **▶ / ◀** in the bar or the note, or `]` / `[` (`J` / `K`), move forward and back.
+   `Esc` leaves the walkthrough and keeps the viewer open.
+
+Walkthroughs are keyed by the content of the map's files, like example inputs: after
+the code changes, generate the example inputs and the walkthrough again.
+
 ## Source viewer
 
 Opens from any citation or path. Syntax highlighting is bundled (highlight.js, no
@@ -412,6 +433,7 @@ checkouts.
 | `maps/<key>.json` | One map per key |
 | `scopes/<hash>.json` | Latest map of a scope: its paths, file manifest and session |
 | `traces/<key>.json` | Example inputs per map content and flow |
+| `walks/<key>.json` | Code walkthrough per example input |
 | `sessions.json`, `sessions-claude.json`, `sessions-anthropic.json` | Per-engine session registries (for `--forget-sessions`) |
 | `anthropic-sessions/<id>.json` | Private native Anthropic conversation histories |
 | `atlas/` | The Markdown atlas |

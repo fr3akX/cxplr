@@ -517,6 +517,7 @@ function renderNodes() {
       ${drill ? `<text class="drill ${childState(node.id)}" x="${p.w - 12}" y="41" text-anchor="end">${drillLabel(node)}</text>` : ''}
     </g>`;
   }).join('');
+  if (walker) markWalkNode();
 }
 
 /** `fresh` / `stale` when the node's inner map is cached, `none` otherwise. */
@@ -1106,12 +1107,14 @@ function renderTraceBox(t) {
       <div class="sc-io"><span class="muted">in</span> <code>${esc(trunc(sc.input, 160))}</code></div>
       <div class="sc-io"><span class="muted">out</span> ${esc(sc.outcome)}</div>
       <div class="sc-now" id="sc-now-${k}"></div>
+      <div class="sc-walk" id="sc-walk-${k}"></div>
       <details><summary>${sc.steps.length} hops</summary><ol class="sc-steps">${sc.steps.map((s) => `<li>
         <b>${esc(nodeById(s.from)?.name || s.from)} → ${esc(nodeById(s.to)?.name || s.to)}</b><div class="muted">${esc(s.action)}</div>
         ${s.payload ? `<pre class="payload">${esc(s.payload)}</pre>` : ''}${s.evidence.length ? evidenceList(s.evidence) : ''}</li>`).join('')}</ol></details>
     </li>`).join('')}</ul>
     ${diagnostics?.length ? `<details><summary class="meta">${diagnostics.length} hops not on the map were dropped</summary><ul>${diagnostics.map((d) => `<li class="meta">${esc(d)}</li>`).join('')}</ul></details>` : ''}
     ${meta ? `<p class="meta">${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in / ${fmtTokens(meta.output_tokens)} out tokens</p>` : ''}`;
+  scenarios.forEach((_, k) => renderWalkStatus(k));
 }
 
 function pollTrace(id, t) {
@@ -1181,8 +1184,226 @@ $('#panel').addEventListener('click', (e) => {
   const play = e.target.closest('[data-trace-play]');
   if (play) {
     e.stopPropagation();
-    playScenarios(play.dataset.tracePlay === '' ? undefined : Number(play.dataset.tracePlay));
+    return playScenarios(play.dataset.tracePlay === '' ? undefined : Number(play.dataset.tracePlay));
   }
+  const walk = e.target.closest('[data-walk]');
+  if (walk) return stepThroughCode(Number(walk.dataset.walk));
+  const walkCancel = e.target.closest('[data-walk-cancel]');
+  if (walkCancel) {
+    const w = walkState.get(walkId(Number(walkCancel.dataset.walkCancel)));
+    walkCancel.disabled = true;
+    if (w?.job) post(`/api/job/${w.job}/cancel`).catch(() => {});
+  }
+});
+
+// ---------- code walkthrough ----------
+
+/**
+ * One example input followed through the code. The viewer docks to the right so the
+ * map stays visible; each step opens its file, highlights its lines with a note under
+ * them, and lights up the map component whose paths contain the file.
+ */
+const walkState = new Map(); // `${scope}#${flow}#${scenario}` -> { status, walk, job, elapsed, last, error }
+let walker = null; // { walk, index, node }
+
+function walkId(k) {
+  return `${traceId()}#${k}`;
+}
+
+function renderWalkStatus(k) {
+  const el = $(`#sc-walk-${k}`);
+  if (!el) return;
+  const w = walkState.get(walkId(k));
+  if (w?.status === 'running') {
+    el.innerHTML = `<div class="status"><div class="spinner"></div><span>${esc(engineName())} is walking the code… ${fmtDuration(w.elapsed || 0)}</span>
+      <button type="button" data-walk-cancel="${k}">Cancel</button></div>${w.last ? `<div class="last">${esc(w.last)}</div>` : ''}`;
+    return;
+  }
+  const ready = w?.status === 'ready';
+  const steps = ready ? w.walk.steps.length : 0;
+  el.innerHTML = `<button type="button" data-walk="${k}" title="${ready ? 'Step through the code this input runs' : `Follow this input through the code, step by step (${esc(engineName())}, read-only, about 1–3 minutes; cached with the map)`}">
+      ${ready ? `Step through code · ${steps} steps` : 'Walk through code'}</button>
+    ${w?.status === 'failed' ? `<span class="error-text">${esc(w.error)}</span>` : ''}`;
+}
+
+async function stepThroughCode(k) {
+  const id = walkId(k);
+  let w = walkState.get(id);
+  if (w?.status === 'running') return;
+  if (w?.status === 'ready') return openWalk(w.walk);
+  w = { status: 'running', elapsed: 0 };
+  walkState.set(id, w);
+  renderWalkStatus(k);
+  try {
+    const query = `scope=${encodeURIComponent(state.scope)}&flow=${state.flow}&scenario=${k}`;
+    const res = await api(`/api/walk?${query}`);
+    if (res.status === 'ready') {
+      Object.assign(w, { status: 'ready', walk: res.walk });
+      renderWalkStatus(k);
+      return openWalk(res.walk);
+    }
+    w.job = res.status === 'running' ? res.job : (await post('/api/walk', { scope: state.scope, flow: state.flow, scenario: k })).job;
+    pollWalk(id, k, w);
+  } catch (err) {
+    Object.assign(w, { status: 'failed', error: err.message });
+    renderWalkStatus(k);
+  }
+}
+
+function pollWalk(id, k, w) {
+  let since = 0;
+  const tick = async () => {
+    let job;
+    try {
+      job = await api(`/api/job/${w.job}?since=${since}`);
+    } catch (err) {
+      Object.assign(w, { status: 'failed', error: err.message });
+      if (walkId(k) === id) renderWalkStatus(k);
+      return;
+    }
+    since = job.next;
+    const lines = job.progress.filter((l) => l.startsWith('$ ') || l.startsWith('› '));
+    if (lines.length) w.last = lines[lines.length - 1];
+    w.elapsed = job.elapsed_ms;
+    if (job.status === 'running') setTimeout(tick, 1000);
+    else if (job.status === 'done') Object.assign(w, { status: 'ready', walk: job.result });
+    else Object.assign(w, { status: job.status === 'cancelled' ? 'missing' : 'failed', error: job.error });
+    if (walkId(k) !== id) return;
+    renderWalkStatus(k);
+    if (w.status === 'ready') openWalk(w.walk);
+  };
+  tick();
+}
+
+function openWalk(walk) {
+  if (!walk.steps.length) return;
+  walker = { walk, index: 0, node: null };
+  $('#modal').classList.add('walking');
+  showWalkStep(0);
+}
+
+function exitWalk() {
+  if (!walker) return;
+  walker = null;
+  clearWalkMarks();
+  document.querySelectorAll('#nodes .node.walk-current').forEach((el) => el.classList.remove('walk-current'));
+  renderWalkBar();
+  $('#modal').classList.remove('walking');
+}
+
+function clearWalkMarks() {
+  document.querySelectorAll('#src-body .src-line.walk-range').forEach((el) => el.classList.remove('walk-range'));
+  document.querySelectorAll('#src-body .walk-card').forEach((el) => el.remove());
+}
+
+async function showWalkStep(i) {
+  if (!walker) return;
+  const { steps } = walker.walk;
+  const index = Math.max(0, Math.min(steps.length - 1, i));
+  walker.index = index;
+  const step = steps[index];
+  clearWalkMarks();
+  markWalkNode();
+  renderWalkBar();
+  if (!step.verified) {
+    $('#modal').hidden = false;
+    return;
+  }
+  await openSource(step.path, step.line);
+  if (walker?.index !== index) return; // stepped again while the file loaded
+  const tab = viewer.active;
+  for (let n = step.line; n <= step.end_line; n++) lineEl(tab, n)?.classList.add('walk-range');
+  const card = document.createElement('div');
+  card.className = 'walk-card';
+  card.innerHTML = walkCardHtml(step, index, steps.length);
+  lineEl(tab, step.end_line)?.after(card);
+  card.scrollIntoView({ block: 'nearest' });
+  const first = lineEl(tab, step.line);
+  if (first && first.getBoundingClientRect().top < $('#src-body').getBoundingClientRect().top) first.scrollIntoView({ block: 'start' });
+}
+
+function walkCardHtml(step, index, total) {
+  return `<div class="wc-head"><span class="wc-kind wc-${esc(step.kind)}">${esc(step.kind)}</span><b>${esc(step.title)}</b>
+      <span class="muted">${index + 1} / ${total}</span></div>
+    ${step.detail ? `<p>${esc(step.detail)}</p>` : ''}
+    ${step.state ? `<pre class="payload">${esc(step.state)}</pre>` : ''}
+    <div class="wc-nav"><button type="button" data-walk-prev ${index === 0 ? 'disabled' : ''}>◀ Back</button>
+      <button type="button" class="primary" data-walk-next ${index === total - 1 ? 'disabled' : ''}>Next ▶</button>
+      <span class="muted">[ / ] or K / J</span></div>`;
+}
+
+function renderWalkBar() {
+  const bar = $('#walk-bar');
+  if (!walker) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  const { walk, index } = walker;
+  const step = walk.steps[index];
+  const meta = walk.meta || {};
+  const node = walker.node && nodeById(walker.node);
+  bar.hidden = false;
+  bar.innerHTML = `<button type="button" data-walk-prev ${index === 0 ? 'disabled' : ''} title="Previous step ([ or K)">◀</button>
+    <span class="wb-count">${index + 1} / ${walk.steps.length}</span>
+    <button type="button" data-walk-next ${index === walk.steps.length - 1 ? 'disabled' : ''} title="Next step (] or J)">▶</button>
+    <span class="wb-title"><b>${esc(meta.scenario || 'Walkthrough')}</b> <span class="muted">${esc(trunc(meta.input || '', 140))}</span></span>
+    ${node ? `<span class="wb-node" title="The map component this code belongs to">${esc(node.name)}</span>` : ''}
+    ${step.verified ? '' : `<span class="error-text" title="${esc(step.title)}">${esc(step.path)}:${step.line}: ${esc(step.problem || 'not verified')}</span>`}
+    <button type="button" data-walk-exit title="Leave the walkthrough (Esc)">✕</button>`;
+}
+
+/** The node of the current map whose paths contain `path` most specifically. */
+function nodeForPath(path) {
+  let best = null;
+  let bestLen = -1;
+  for (const n of state.map?.nodes || []) {
+    for (const raw of n.paths) {
+      const p = raw.replace(/^\.\//, '').replace(/\/+$/, '');
+      const len = p === '' || p === '.' ? 0 : path === p || path.startsWith(`${p}/`) ? p.length : -1;
+      if (len > bestLen) { bestLen = len; best = n.id; }
+    }
+  }
+  return best;
+}
+
+/** Light up the current step's component; pulse it when the step enters a new one. */
+function markWalkNode() {
+  const step = walker.walk.steps[walker.index];
+  const id = step.verified ? nodeForPath(step.path) : null;
+  const entered = id !== walker.node;
+  walker.node = id;
+  document.querySelectorAll('#nodes .node.walk-current').forEach((el) => el.classList.remove('walk-current'));
+  const el = id && document.querySelector(`#nodes .node[data-node="${CSS.escape(id)}"]`);
+  if (!el) return;
+  el.classList.add('walk-current');
+  if (entered) {
+    el.classList.remove('sim-hit');
+    void el.getBoundingClientRect(); // restart the animation
+    el.classList.add('sim-hit');
+  }
+  keepNodeVisible(el);
+}
+
+/** Pan the map so `el` sits in the part not covered by the docked viewer. */
+function keepNodeVisible(el) {
+  const s = svg.getBoundingClientRect();
+  const box = $('#modal').hidden ? null : $('.modal-box').getBoundingClientRect();
+  const left = s.left + 16;
+  const right = Math.min(s.right, box ? box.left : s.right) - 16;
+  if (right - left < 120) return;
+  const r = el.getBoundingClientRect();
+  if (r.left >= left && r.right <= right && r.top >= s.top + 16 && r.bottom <= s.bottom - 16) return;
+  state.view.x += (left + right) / 2 - (r.left + r.right) / 2;
+  state.view.y += (s.top + s.bottom) / 2 - (r.top + r.bottom) / 2;
+  applyView();
+}
+
+$('#modal').addEventListener('click', (e) => {
+  if (!walker) return;
+  if (e.target.closest('[data-walk-prev]')) return showWalkStep(walker.index - 1);
+  if (e.target.closest('[data-walk-next]')) return showWalkStep(walker.index + 1);
+  if (e.target.closest('[data-walk-exit]')) return exitWalk();
 });
 
 // ---------- highlighting ----------
@@ -1684,6 +1905,7 @@ $('#src-tabs').addEventListener('auxclick', (e) => {
 
 /** Hide the viewer; tabs, their scroll positions and threads stay for the next file opened. */
 function closeSource() {
+  exitWalk();
   rememberScroll();
   $('#modal').hidden = true;
   $('#sym').hidden = true;
@@ -2288,8 +2510,13 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     return focusFind();
   }
+  if (walker && modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !e.target.closest('input, textarea')) {
+    if (e.key === ']' || e.key === 'j' || e.key === 'J') { e.preventDefault(); return showWalkStep(walker.index + 1); }
+    if (e.key === '[' || e.key === 'k' || e.key === 'K') { e.preventDefault(); return showWalkStep(walker.index - 1); }
+  }
   if (e.key === 'Escape') {
     if (modalOpen && !$('#sym').hidden) { $('#sym').hidden = true; return; }
+    if (modalOpen && walker) return exitWalk();
     if (modalOpen) return closeSource();
     if (e.target.closest('input, textarea')) return;
     if (state.selected || state.flow !== null) { state.selected = null; state.flow = null; applyHighlight(); renderPanel(); }
