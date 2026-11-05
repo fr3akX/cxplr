@@ -547,6 +547,7 @@ function applyHighlight() {
     edges[i].classList.add('hi');
     $('path.line', edges[i]).setAttribute('marker-end', 'url(#arrow-hi)');
   };
+  if (walker) return applyWalkHighlight(nodes, edges, hiEdge, overlay);
 
   if (flow !== null && map.flows[flow]) {
     const steps = map.flows[flow].steps;
@@ -572,13 +573,7 @@ function applyHighlight() {
     nodes.forEach((el) => { if (!litNodes.has(el.dataset.node)) el.classList.add('dim'); });
     const litEdges = new Set([...badges.values()].map((b) => b.edge).filter((i) => i >= 0));
     edges.forEach((el, i) => { if (litEdges.has(i)) hiEdge(i); else el.classList.add('dim'); });
-    for (const { mid, numbers } of badges.values()) {
-      const text = numbers.join(',');
-      const r = Math.max(10, text.length * 3.6 + 5);
-      overlay.insertAdjacentHTML('beforeend', `<g class="step-badge" transform="translate(${mid[0]},${mid[1] + 9})">
-        <rect x="${-r}" y="-10" width="${2 * r}" height="20" rx="10" style="fill:var(--accent)"></rect>
-        <text text-anchor="middle" y="4">${esc(text)}</text></g>`);
-    }
+    drawStepBadges(overlay, badges);
     return;
   }
 
@@ -601,6 +596,17 @@ function applyHighlight() {
       else el.classList.add('dim');
     });
     edges.forEach((el, i) => { if (i === selected.index) hiEdge(i); else el.classList.add('dim'); });
+  }
+}
+
+/** Step-number badges at the middle of arrows: `badges` maps a key to { mid, numbers }. */
+function drawStepBadges(overlay, badges) {
+  for (const { mid, numbers } of badges.values()) {
+    const text = numbers.join(',');
+    const r = Math.max(10, text.length * 3.6 + 5);
+    overlay.insertAdjacentHTML('beforeend', `<g class="step-badge" transform="translate(${mid[0]},${mid[1] + 9})">
+      <rect x="${-r}" y="-10" width="${2 * r}" height="20" rx="10" style="fill:var(--accent)"></rect>
+      <text text-anchor="middle" y="4">${esc(text)}</text></g>`);
   }
 }
 
@@ -1285,9 +1291,11 @@ function openWalk(walk) {
 function exitWalk() {
   if (!walker) return;
   walker = null;
+  stopSim();
   clearWalkMarks();
   document.querySelectorAll('#nodes .node.walk-current').forEach((el) => el.classList.remove('walk-current'));
   renderWalkBar();
+  applyHighlight();
   $('#modal').classList.remove('walking');
 }
 
@@ -1303,7 +1311,8 @@ async function showWalkStep(i) {
   walker.index = index;
   const step = steps[index];
   clearWalkMarks();
-  markWalkNode();
+  markWalkNode({ animate: true });
+  applyHighlight();
   renderWalkBar();
   if (!step.verified) {
     $('#modal').hidden = false;
@@ -1367,22 +1376,88 @@ function nodeForPath(path) {
   return best;
 }
 
-/** Light up the current step's component; pulse it when the step enters a new one. */
-function markWalkNode() {
-  const step = walker.walk.steps[walker.index];
-  const id = step.verified ? nodeForPath(step.path) : null;
-  const entered = id !== walker.node;
+/** Component of step `i`: its file's component, or the last one before it. */
+function walkNodeAt(i) {
+  for (let k = i; k >= 0; k--) {
+    const s = walker.walk.steps[k];
+    const id = s.verified ? nodeForPath(s.path) : null;
+    if (id) return id;
+  }
+  return null;
+}
+
+/** Every step that enters another component: { index, from, to }. */
+function walkHops() {
+  const hops = [];
+  let prev = null;
+  walker.walk.steps.forEach((s, index) => {
+    const id = s.verified ? nodeForPath(s.path) : null;
+    if (!id) return;
+    if (prev && id !== prev) hops.push({ index, from: prev, to: id });
+    prev = id;
+  });
+  return hops;
+}
+
+/**
+ * Light up the current step's component. With `animate`, a step into another
+ * component sends a token along the arrow between them (backwards when stepping back).
+ */
+function markWalkNode({ animate = false } = {}) {
+  const id = walkNodeAt(walker.index);
+  const from = walker.node;
   walker.node = id;
   document.querySelectorAll('#nodes .node.walk-current').forEach((el) => el.classList.remove('walk-current'));
   const el = id && document.querySelector(`#nodes .node[data-node="${CSS.escape(id)}"]`);
   if (!el) return;
   el.classList.add('walk-current');
-  if (entered) {
+  keepNodeVisible(el);
+  if (!animate || from === id) return;
+  if (from && state.layout.at[from]) {
+    runSim([[{ from, to: id }]], { labels: [String(walker.index + 1)] });
+  } else {
     el.classList.remove('sim-hit');
     void el.getBoundingClientRect(); // restart the animation
     el.classList.add('sim-hit');
   }
-  keepNodeVisible(el);
+}
+
+/** Map highlight while walking: arrows walked so far numbered by step, the rest dimmed. */
+function applyWalkHighlight(nodes, edges, hiEdge, overlay) {
+  const { map } = state;
+  const onWalk = new Set(walker.walk.steps.map((s) => (s.verified ? nodeForPath(s.path) : null)).filter(Boolean));
+  const walked = new Set();
+  const upcoming = new Set();
+  const badges = new Map();
+  for (const h of walkHops()) {
+    let i = map.edges.findIndex((e) => e.from === h.from && e.to === h.to);
+    if (i < 0) i = map.edges.findIndex((e) => e.from === h.to && e.to === h.from);
+    if (h.index > walker.index) {
+      if (i >= 0) upcoming.add(i);
+      continue;
+    }
+    let key;
+    let mid;
+    if (i >= 0) {
+      walked.add(i);
+      key = `e${i}`;
+      mid = state.edgeGeom[i].mid;
+    } else {
+      // No arrow between the two components on this map: draw a dashed guide.
+      key = `g${h.from}>${h.to}`;
+      const g = edgePath(state.layout, h, 0);
+      if (!badges.has(key)) overlay.insertAdjacentHTML('beforeend', `<path class="ghost" d="${g.d}" marker-end="url(#arrow-hi)"></path>`);
+      mid = g.mid;
+    }
+    if (!badges.has(key)) badges.set(key, { mid, numbers: [] });
+    badges.get(key).numbers.push(h.index + 1);
+  }
+  nodes.forEach((el) => { if (!onWalk.has(el.dataset.node)) el.classList.add('dim'); });
+  edges.forEach((el, i) => {
+    if (walked.has(i)) hiEdge(i);
+    else if (!upcoming.has(i)) el.classList.add('dim');
+  });
+  drawStepBadges(overlay, badges);
 }
 
 /** Pan the map so `el` sits in the part not covered by the docked viewer. */

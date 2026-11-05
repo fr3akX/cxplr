@@ -244,10 +244,12 @@ Step through the code one example input actually runs, like a debugger you move 
    range is checked against the files; the result is cached, and the button then reads
    **Step through code · N steps**.
 2. The source viewer docks to the right so the map stays visible. Each step opens its
-   file in a tab, highlights its lines and shows a note under them; the map lights up
-   the component whose paths contain the file and pulses it when the walk enters a new
-   one (the bar shows its name). The component is worked out from the file path, so this
-   also works after zooming into a component's own map.
+   file in a tab, highlights its lines and shows a note under them. On the map, the
+   component whose paths contain the file is lit (the bar shows its name); a step into
+   another component sends a numbered token along the arrow between them (backwards
+   when stepping back), arrows walked so far stay highlighted with their step numbers,
+   and components the walk never visits are dimmed. The component is worked out from
+   the file path, so this also works after zooming into a component's own map.
 3. **▶ / ◀** in the bar or the note, or `]` / `[` (`J` / `K`), move forward and back.
    `Esc` leaves the walkthrough and keeps the viewer open.
 
