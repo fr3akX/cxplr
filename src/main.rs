@@ -1,29 +1,34 @@
 mod anthropic;
 mod anthropic_auth;
-mod anthropic_tools;
 mod anthropic_wire;
 mod ask;
 mod atlas;
 mod cache;
 mod claude;
 mod codex;
+mod config;
+mod configure;
 mod engine;
 mod explore;
 mod index;
 mod lsp;
 mod map;
+mod native;
+mod openai;
 mod prompt;
 mod repo;
+mod repo_tools;
 mod search;
 mod server;
 mod skill;
+mod term;
 mod trace;
 mod update;
 mod verify;
 mod walk;
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,12 +45,28 @@ struct Args {
     host: String,
     #[arg(long, default_value_t = 7878)]
     port: u16,
-    /// Agent: codex app-server, claude -p, or native Anthropic Messages
-    #[arg(long, value_enum, default_value = "codex")]
-    engine: engine::Kind,
-    /// Model (CLI engines use their config; native Anthropic defaults to claude-sonnet-5-5)
+    /// Agent: codex app-server, claude -p, native Anthropic Messages, or an
+    /// OpenAI-compatible Chat Completions server (default: the configured engine,
+    /// else codex)
+    #[arg(long, value_enum)]
+    engine: Option<engine::Kind>,
+    /// Model (default: the configured model; CLI engines use their own config,
+    /// native Anthropic claude-sonnet-5-5, openai $OPENAI_MODEL or the server's only model)
     #[arg(long)]
     model: Option<String>,
+    /// OpenAI-compatible API root for --engine openai (also $OPENAI_BASE_URL; a bare
+    /// host gets /v1). The API key, if the server needs one, comes from $OPENAI_API_KEY
+    #[arg(long)]
+    openai_base_url: Option<String>,
+    /// Engine for questions, example inputs and walkthroughs (default: --engine). With
+    /// another engine or model than indexing, their sessions start seeded with the
+    /// atlas instead of forking the map's session
+    #[arg(long, value_enum)]
+    ask_engine: Option<engine::Kind>,
+    /// Model for questions, example inputs and walkthroughs (default: --model when
+    /// the ask engine is the indexing engine, else that engine's default)
+    #[arg(long)]
+    ask_model: Option<String>,
     /// Codex executable (run as `codex app-server`)
     #[arg(long, default_value = "codex")]
     codex: String,
@@ -101,6 +122,10 @@ struct Args {
     /// sessions at `.cxplr/atlas` in repositories that have one
     #[arg(long)]
     install_skill: bool,
+    /// Set up the global configuration interactively (engines, models, OpenAI server)
+    /// and exit; also offered on the first interactive launch without one
+    #[arg(long)]
+    configure: bool,
     /// Install the latest release now (for installs made with the release installer) and exit
     #[arg(long)]
     update: bool,
@@ -157,6 +182,38 @@ async fn rebuild_atlas(ex: &Arc<explore::Explorer>) {
     }
 }
 
+/// Engine settings shared by the indexing and ask engines, already resolved from
+/// flags, the environment and the configuration.
+struct EngineOpts {
+    codex: String,
+    claude: String,
+    openai_base_url: String,
+    openai_api_key: Option<String>,
+    timeout: Duration,
+}
+
+async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
+    let timeout = o.timeout;
+    Ok(match kind {
+        engine::Kind::Codex => {
+            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, timeout };
+            engine::Engine::Codex(codex::Codex::start(cfg, root).await?)
+        }
+        engine::Kind::Claude => {
+            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
+            engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, root).await?))
+        }
+        engine::Kind::Anthropic => {
+            let model = model.or_else(|| Some(anthropic::DEFAULT_MODEL.to_owned()));
+            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, timeout).await?))
+        }
+        engine::Kind::OpenAi => {
+            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
+            engine::Engine::OpenAi(Arc::new(openai::OpenAi::start(root, cache_dir, cfg).await?))
+        }
+    })
+}
+
 /// Raise the soft open-file limit to the hard limit. `codex app-server` keeps every
 /// session it has loaded open until it exits, and a large index loads dozens, which
 /// runs out of descriptors under macOS's default soft limit of 256. The app-server
@@ -191,13 +248,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         anthropic_auth::login().await?;
         return Ok(());
     }
+    if args.configure {
+        if !term::interactive() {
+            return Err("--configure asks questions: run it in a terminal".into());
+        }
+        configure::run(config::load()?).await?;
+        return Ok(());
+    }
     if args.update {
         // The new binary refreshes an installed skill on its first start.
         println!("{}", update::update_now().await?);
         return Ok(());
     }
+    let mut cfg = config::load()?;
+    // First interactive launch without a configuration: set one up, then carry on.
+    // Explicit engine flags, one-off actions and non-interactive runs skip it.
+    let engine_flags = args.engine.is_some() || args.model.is_some() || args.ask_engine.is_some() || args.ask_model.is_some() || args.openai_base_url.is_some();
+    if cfg.is_none() && !engine_flags && !args.install_skill && !args.forget_sessions && term::interactive() {
+        println!("No cxplr configuration yet; let's set it up first (`cxplr --configure` changes it later).\n");
+        cfg = Some(configure::run(None).await?);
+    }
+    let cfg = cfg.unwrap_or_default();
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let mut choice = config::choose(&cfg, args.engine, args.model.clone(), args.ask_engine, args.ask_model.clone());
+    // $OPENAI_MODEL sits between flags and the configuration, like the other OpenAI variables.
+    if choice.engine == engine::Kind::OpenAi && args.model.is_none() {
+        choice.model = env("OPENAI_MODEL").or(choice.model);
+    }
+    if choice.ask_engine == engine::Kind::OpenAi && choice.ask_engine != choice.engine && args.ask_model.is_none() {
+        choice.ask_model = env("OPENAI_MODEL").or(choice.ask_model);
+    }
     if args.install_skill {
-        let path = skill::install(args.engine)?;
+        let path = skill::install(choice.engine).map_err(|e| e.to_string())?;
         println!("installed the cxplr skill at {}", path.display());
         return Ok(());
     }
@@ -216,66 +298,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raise_open_file_limit();
     let repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
-    let model = match (args.engine, args.model) {
-        (engine::Kind::Anthropic, None) => Some(anthropic::DEFAULT_MODEL.to_owned()),
-        (_, model) => model,
+    let opts = EngineOpts {
+        codex: args.codex,
+        claude: args.claude,
+        openai_base_url: args.openai_base_url.or_else(|| env("OPENAI_BASE_URL")).or(cfg.openai_base_url).unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_owned()),
+        openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
+        timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let cache = cache::Cache::open(cache_dir.clone(), args.engine, model.as_deref())
+    let engine = start_engine(choice.engine, choice.model, &opts, &repo.root, &cache_dir).await?;
+    let same_model = choice.ask_model.as_deref().is_none_or(|m| Some(m) == engine.model());
+    let asker = if choice.ask_engine == choice.engine && same_model {
+        None
+    } else {
+        Some(start_engine(choice.ask_engine, choice.ask_model, &opts, &repo.root, &cache_dir).await?)
+    };
+    // Keys include the model the engine actually uses (the openai engine may pick it).
+    let cache = cache::Cache::open(cache_dir.clone(), choice.engine, engine.model())
         .map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
-    let timeout = Duration::from_secs(args.timeout_mins.max(1) * 60);
-    let engine = match args.engine {
-        engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: args.codex, model, timeout };
-            engine::Engine::Codex(codex::Codex::start(cfg, &repo.root).await?)
-        }
-        engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: args.claude, model, timeout };
-            engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, &repo.root).await?))
-        }
-        engine::Kind::Anthropic => {
-            let native = anthropic::Anthropic::start(&repo.root, &cache_dir, model, timeout).await?;
-            engine::Engine::Anthropic(Arc::new(native))
-        }
-    };
-    let ex = Arc::new(explore::Explorer { repo, cache, engine });
+    let ex = Arc::new(explore::Explorer { repo, cache, engine, asker });
 
     let commit = ex.repo.head().map_or("no git commit".to_owned(), |c| c[..c.len().min(12)].to_owned());
-    println!("cxplr: {} ({commit}), engine {}, cache {}", ex.repo.root.display(), args.engine.id(), cache_dir.display());
+    let describe = |e: &engine::Engine| format!("{}{}", e.kind().id(), e.model().map_or(String::new(), |m| format!(" ({m})")));
+    let asks = ex.asker.as_ref().map_or(String::new(), |a| format!(", asks {}", describe(a)));
+    println!("cxplr: {} ({commit}), engine {}{asks}, cache {}", ex.repo.root.display(), describe(&ex.engine), cache_dir.display());
 
     if args.forget_sessions {
-        let sessions = ex.cache.sessions();
-        // Codex refuses to delete a session while forks of it exist. Ids are
-        // time-ordered, so newest first removes forks before their parents; further
-        // passes retry whatever a remaining fork still blocked.
-        let mut pending: Vec<(&String, &String)> = sessions.iter().rev().collect();
-        let mut deleted = Vec::new();
-        let mut errors = Vec::new();
-        loop {
-            errors.clear();
-            let before = pending.len();
-            let mut blocked = Vec::new();
-            for (id, name) in pending {
-                match ex.engine.delete_session(id).await {
-                    Ok(()) => {
-                        println!("  deleted {id} ({name})");
-                        deleted.push(id.clone());
-                    }
-                    Err(e) => {
-                        errors.push(format!("  ✗ {id} ({name}): {e}"));
-                        blocked.push((id, name));
+        // Each engine's registry once (an ask engine of the same kind shares it).
+        let engines = std::iter::once(&ex.engine).chain(ex.asker.iter().filter(|a| a.kind() != ex.engine.kind()));
+        for engine in engines {
+            let sessions = ex.cache.sessions(engine.kind());
+            // Codex refuses to delete a session while forks of it exist. Ids are
+            // time-ordered, so newest first removes forks before their parents; further
+            // passes retry whatever a remaining fork still blocked.
+            let mut pending: Vec<(&String, &String)> = sessions.iter().rev().collect();
+            let mut deleted = Vec::new();
+            let mut errors = Vec::new();
+            loop {
+                errors.clear();
+                let before = pending.len();
+                let mut blocked = Vec::new();
+                for (id, name) in pending {
+                    match engine.delete_session(id).await {
+                        Ok(()) => {
+                            println!("  deleted {id} ({name})");
+                            deleted.push(id.clone());
+                        }
+                        Err(e) => {
+                            errors.push(format!("  ✗ {id} ({name}): {e}"));
+                            blocked.push((id, name));
+                        }
                     }
                 }
+                pending = blocked;
+                if pending.is_empty() || pending.len() == before {
+                    break;
+                }
             }
-            pending = blocked;
-            if pending.is_empty() || pending.len() == before {
-                break;
+            for e in &errors {
+                println!("{e}");
             }
+            ex.cache.forget_sessions(engine.kind(), &deleted)?;
+            println!("forgot {} of {} cxplr {} sessions; cached maps are kept", deleted.len(), sessions.len(), engine.kind().id());
         }
-        for e in &errors {
-            println!("{e}");
-        }
-        ex.cache.forget_sessions(&deleted)?;
-        println!("forgot {} of {} cxplr sessions; cached maps are kept", deleted.len(), sessions.len());
         return Ok(());
     }
 

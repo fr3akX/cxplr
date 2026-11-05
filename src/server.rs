@@ -160,6 +160,10 @@ async fn repo_info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "commit": st.repo.head(),
         "engine": st.engine.kind().id(),
         "model": st.engine.model(),
+        "ask_engine": st.ask_engine().kind().id(),
+        "ask_model": st.ask_engine().model(),
+        // Separate ask engine or model: new conversations start seeded with the atlas.
+        "ask_seeded": st.asker.is_some(),
         "cache": st.cache.dir(),
     }))
 }
@@ -300,21 +304,23 @@ async fn answer_question(
     let crumbs = map.as_ref().and_then(|m| m.meta.as_ref()).map_or_else(|| vec![st.repo.name.clone()], |m| m.crumbs.clone());
     let mut progress = |line: String| job.push(line);
     // Follow-ups continue the conversation's session; a new conversation forks the
-    // session of the map being viewed, which has already read that part of the code.
-    let (session, follow_up) = match req.session.clone() {
+    // session of the map being viewed (or, with a separate ask engine, starts one
+    // seeded with the atlas).
+    let (session, follow_up, context) = match req.session.clone() {
         Some(session) => {
             progress(format!("Continuing conversation in session {session}"));
-            (session, true)
+            (session, true, None)
         }
         None => {
             let name = st.session_name(&format!("ask · {}", crumbs.join(" › ")));
-            (st.session_from(Some(&req.context.scope), &name, &mut progress).await?, false)
+            let (session, context) = st.ask_session(&req.context.scope, &name, &mut progress).await?;
+            (session, false, context)
         }
     };
     let view = ask::View { crumbs, map: map.as_ref(), node, selection };
-    let prompt = ask::prompt(&st.repo.name, &view, &req.question, follow_up);
+    let prompt = atlas::seeded(context, ask::prompt(&st.repo.name, &view, &req.question, follow_up));
     let started = Instant::now();
-    let out = st.engine.turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
+    let out = st.ask_engine().turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
     let mut answer = out.answer;
     verify::verify_citations(&st.repo.root, &mut answer.citations);
     Ok(json!({
@@ -379,12 +385,12 @@ async fn start_trace(State(st): State<Arc<AppState>>, Json(req): Json<TraceReque
 async fn generate_trace(st: &AppState, job: &Job, scope: &str, map: &crate::map::Map, flow: usize) -> Result<Value, String> {
     let flow = &map.flows[flow];
     let mut progress = |line: String| job.push(line);
-    progress(format!("Tracing example inputs through “{}” with {} (read-only)", flow.name, st.engine.kind().id()));
+    progress(format!("Tracing example inputs through “{}” with {} (read-only)", flow.name, st.ask_engine().kind().id()));
     let name = st.session_name(&format!("examples · {}", flow.name));
-    let session = st.session_from(Some(scope), &name, &mut progress).await?;
+    let (session, context) = st.ask_session(scope, &name, &mut progress).await?;
     let started = Instant::now();
-    let prompt = trace::prompt(map, flow);
-    let out = st.engine.turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
+    let prompt = atlas::seeded(context, trace::prompt(map, flow));
+    let out = st.ask_engine().turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
     let mut traces = out.answer;
     traces.diagnostics.clear();
     trace::normalize(&mut traces, map);
@@ -473,16 +479,16 @@ async fn generate_walk(
 ) -> Result<Value, String> {
     let flow = &map.flows[flow];
     let mut progress = |line: String| job.push(line);
-    progress(format!("Walking “{}” through the code with {} (read-only)", scenario.name, st.engine.kind().id()));
+    progress(format!("Walking “{}” through the code with {} (read-only)", scenario.name, st.ask_engine().kind().id()));
     let name = st.session_name(&format!("walkthrough · {} · {}", flow.name, scenario.name));
-    let session = st.session_from(Some(scope), &name, &mut progress).await?;
+    let (session, context) = st.ask_session(scope, &name, &mut progress).await?;
     let started = Instant::now();
-    let prompt = walk::prompt(map, flow, scenario);
-    let out = st.engine.turn::<walk::Walk>(&session, &prompt, &walk::schema(), &job.cancel, &mut progress).await?;
+    let prompt = atlas::seeded(context, walk::prompt(map, flow, scenario));
+    let out = st.ask_engine().turn::<walk::Walk>(&session, &prompt, &walk::schema(), &job.cancel, &mut progress).await?;
     let mut walk = out.answer;
     walk::verify(&st.repo.root, &mut walk);
     if walk.steps.is_empty() {
-        return Err(format!("{} returned no steps for this example", st.engine.kind().id()));
+        return Err(format!("{} returned no steps for this example", st.ask_engine().kind().id()));
     }
     walk.meta = Some(walk::WalkMeta {
         flow: flow.name.clone(),

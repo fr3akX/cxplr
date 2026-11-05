@@ -154,6 +154,59 @@ code: read the changed files it lists.\n\n",
     p
 }
 
+/// Longest atlas context put in front of a seeded session's first prompt.
+const MAX_CONTEXT_CHARS: usize = 60_000;
+
+/// The atlas pages from the system map down to `scope` (as far as they exist), for a
+/// session that starts without the index session's history. Closest pages win when
+/// the whole chain is too long: the system page and `scope`'s own page come first.
+pub fn context(cache: &Cache, scope: &str) -> Option<String> {
+    let root = cache.dir().join("atlas");
+    let ids: Vec<&str> = if scope.is_empty() { vec![] } else { scope.split('/').collect() };
+    let chain: Vec<String> = (0..=ids.len()).map(|n| ids[..n].join("/")).collect();
+    let page = |s: &str| {
+        let path = if s.is_empty() { root.join("README.md") } else { root.join(s).join("README.md") };
+        fs::read_to_string(path).ok().map(|text| (s.to_owned(), text))
+    };
+    // Priority: system, current scope, then the levels between, nearest first.
+    let mut order: Vec<&String> = vec![&chain[0]];
+    if chain.len() > 1 {
+        order.push(&chain[chain.len() - 1]);
+        order.extend(chain[1..chain.len() - 1].iter().rev());
+    }
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut used = 0;
+    for s in order {
+        let Some((s, text)) = page(s) else { continue };
+        if used + text.len() > MAX_CONTEXT_CHARS && !kept.is_empty() {
+            continue;
+        }
+        used += text.len();
+        kept.push((s, text));
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    // Back in hierarchy order for reading.
+    kept.sort_by_key(|(s, _)| if s.is_empty() { 0 } else { s.split('/').count() });
+    let mut out = String::from(
+        "Architecture atlas of this repository, written by cxplr from earlier explorations. \
+Use it to orient; check the code before relying on it (pages marked stale describe older code).\n",
+    );
+    for (s, text) in kept {
+        let _ = write!(out, "\n===== atlas page: {} =====\n{text}", if s.is_empty() { "system" } else { &s });
+    }
+    Some(out)
+}
+
+/// `prompt`, preceded by the atlas context when the session was seeded with one.
+pub fn seeded(context: Option<String>, prompt: String) -> String {
+    match context {
+        Some(context) => format!("{context}\n===== end of atlas =====\n\n{prompt}"),
+        None => prompt,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +242,29 @@ mod tests {
         assert!(page.contains("| ext \\| name | module | — | — |"));
         assert!(page.contains("`src/a.rs:3` *unverified*"));
         assert!(page.contains("- **a | name → b | name** (call): x \\| y"));
+    }
+
+    #[test]
+    fn context_keeps_the_system_and_current_pages_when_the_chain_is_too_long() {
+        let dir = std::env::temp_dir().join(format!("cxplr-atlas-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let cache = Cache::open(dir.join(".cxplr"), crate::engine::Kind::Codex, None).unwrap();
+        let atlas = cache.dir().join("atlas");
+        assert_eq!(context(&cache, "a/b"), None); // no atlas yet
+        fs::create_dir_all(atlas.join("a/b")).unwrap();
+        fs::write(atlas.join("README.md"), "SYSTEM PAGE\n").unwrap();
+        fs::write(atlas.join("a/README.md"), "A PAGE ".repeat(MAX_CONTEXT_CHARS / 6)).unwrap();
+        fs::write(atlas.join("a/b/README.md"), "B PAGE\n").unwrap();
+
+        let deep = context(&cache, "a/b").unwrap();
+        let (system, b) = (deep.find("atlas page: system").unwrap(), deep.find("atlas page: a/b").unwrap());
+        assert!(system < b, "pages stay in hierarchy order");
+        assert!(!deep.contains("A PAGE"), "the level in between is dropped when it does not fit");
+
+        let top = context(&cache, "").unwrap();
+        assert!(top.contains("SYSTEM PAGE") && !top.contains("B PAGE"));
+        assert_eq!(seeded(None, "question".into()), "question");
+        assert!(seeded(Some(top), "question".into()).ends_with("===== end of atlas =====\n\nquestion"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

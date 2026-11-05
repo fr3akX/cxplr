@@ -1,4 +1,5 @@
-//! Engines: Codex app-server, Claude Code CLI, or native Anthropic Messages.
+//! Engines: Codex app-server, Claude Code CLI, native Anthropic Messages, or any
+//! OpenAI-compatible Chat Completions server.
 //!
 //! All keep persisted, read-only sessions. cxplr arranges them in a tree that
 //! mirrors the map (see `explore.rs`): a component is explored in a fork of its
@@ -8,6 +9,7 @@
 use crate::anthropic::Anthropic;
 use crate::claude::Claude;
 use crate::codex::Codex;
+use crate::openai::OpenAi;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::Arc;
@@ -16,11 +18,14 @@ use tokio::sync::Notify;
 /// Start of the error for a turn in a session that no longer exists.
 pub const SESSION_GONE: &str = "session not found";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Codex,
     Claude,
     Anthropic,
+    #[value(name = "openai")]
+    OpenAi,
 }
 
 impl Kind {
@@ -30,13 +35,14 @@ impl Kind {
             Kind::Codex => "codex",
             Kind::Claude => "claude",
             Kind::Anthropic => "anthropic",
+            Kind::OpenAi => "openai",
         }
     }
 }
 
 pub struct Outcome<T> {
     pub answer: T,
-    /// Shell commands (Codex) or tool calls (Claude Code) the turn ran.
+    /// Shell commands (Codex) or tool calls (the other engines) the turn ran.
     pub commands: u32,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -47,6 +53,7 @@ pub enum Engine {
     Codex(Arc<Codex>),
     Claude(Arc<Claude>),
     Anthropic(Arc<Anthropic>),
+    OpenAi(Arc<OpenAi>),
 }
 
 impl Engine {
@@ -55,6 +62,7 @@ impl Engine {
             Engine::Codex(_) => Kind::Codex,
             Engine::Claude(_) => Kind::Claude,
             Engine::Anthropic(_) => Kind::Anthropic,
+            Engine::OpenAi(_) => Kind::OpenAi,
         }
     }
 
@@ -63,6 +71,7 @@ impl Engine {
             Engine::Codex(c) => c.model(),
             Engine::Claude(c) => c.model(),
             Engine::Anthropic(c) => c.model(),
+            Engine::OpenAi(c) => c.model(),
         }
     }
 
@@ -72,6 +81,7 @@ impl Engine {
             Engine::Codex(c) => c.start_thread(name).await,
             Engine::Claude(c) => c.start_session(name),
             Engine::Anthropic(c) => c.start_session(name),
+            Engine::OpenAi(c) => c.start_session(name),
         }
     }
 
@@ -81,6 +91,7 @@ impl Engine {
             Engine::Codex(c) => c.fork(parent, name).await,
             Engine::Claude(c) => c.fork(parent, name),
             Engine::Anthropic(c) => c.fork(parent, name),
+            Engine::OpenAi(c) => c.fork(parent, name),
         }
     }
 
@@ -90,6 +101,7 @@ impl Engine {
             Engine::Codex(c) => c.delete_thread(id).await,
             Engine::Claude(c) => c.delete_session(id),
             Engine::Anthropic(c) => c.delete_session(id),
+            Engine::OpenAi(c) => c.delete_session(id),
         }
     }
 
@@ -106,6 +118,7 @@ impl Engine {
             Engine::Codex(c) => c.turn(session, prompt, schema, cancel, progress).await?,
             Engine::Claude(c) => c.turn(session, prompt, schema, cancel, progress).await?,
             Engine::Anthropic(c) => c.turn(session, prompt, schema, cancel, progress).await?,
+            Engine::OpenAi(c) => c.turn(session, prompt, schema, cancel, progress).await?,
         };
         let answer = T::deserialize(&out.answer).map_err(|e| {
             format!("{} answer does not match the schema ({e}): {}", self.kind().id(), one_line(&out.answer.to_string(), 400))

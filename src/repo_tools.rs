@@ -1,7 +1,8 @@
-//! Read-only repository tools for the native Anthropic engine: numbered file reads,
-//! regex search, glob and directory listing. Everything is confined to the canonical
-//! repository root, skips tool state directories and ignored files, and returns
-//! bounded plain text. Nothing here executes code or touches the network.
+//! Read-only repository tools for cxplr's own agent loops (native Anthropic and
+//! OpenAI-compatible): numbered file reads, regex search, glob and directory listing.
+//! Everything is confined to the canonical repository root, skips tool state
+//! directories and ignored files, and returns bounded plain text. Nothing here
+//! executes code or touches the network.
 
 use crate::repo::is_tool_dir;
 use crate::verify;
@@ -40,7 +41,8 @@ impl Tools {
         Ok(Tools { root })
     }
 
-    /// Anthropic tool definitions for `_read`, `_grep`, `_glob` and `_list`.
+    /// Definitions for `_read`, `_grep`, `_glob` and `_list` as `{ name, description,
+    /// input_schema }` (the Anthropic shape; OpenAI-compatible engines convert them).
     pub fn definitions() -> Vec<Value> {
         vec![
             json!({

@@ -176,35 +176,36 @@ impl Cache {
         (binding.engine.as_deref().unwrap_or("codex") == self.engine).then_some(binding.session).flatten()
     }
 
-    fn sessions_file(&self) -> PathBuf {
-        match self.engine {
-            "codex" => self.dir.join("sessions.json"),
-            other => self.dir.join(format!("sessions-{other}.json")),
+    fn sessions_file(&self, engine: Kind) -> PathBuf {
+        match engine {
+            Kind::Codex => self.dir.join("sessions.json"),
+            other => self.dir.join(format!("sessions-{}.json", other.id())),
         }
     }
 
-    /// Every session of this engine cxplr created for this project (id → name).
-    pub fn sessions(&self) -> BTreeMap<String, String> {
-        fs::read(self.sessions_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    /// Every session of `engine` cxplr created for this project (id → name).
+    pub fn sessions(&self, engine: Kind) -> BTreeMap<String, String> {
+        fs::read(self.sessions_file(engine)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    pub fn record_session(&self, id: &str, name: &str) -> io::Result<()> {
+    pub fn record_session(&self, engine: Kind, id: &str, name: &str) -> io::Result<()> {
         let _guard = self.sessions_lock.lock().unwrap();
-        let mut all = self.sessions();
+        let mut all = self.sessions(engine);
         all.insert(id.to_owned(), name.to_owned());
-        write_atomic(&self.sessions_file(), &serde_json::to_vec_pretty(&all)?)
+        write_atomic(&self.sessions_file(engine), &serde_json::to_vec_pretty(&all)?)
     }
 
-    /// Forget deleted sessions: drop them from the registry and from every map binding.
-    pub fn forget_sessions(&self, deleted: &[String]) -> io::Result<()> {
+    /// Forget deleted sessions of `engine`: drop them from its registry and from every
+    /// map binding.
+    pub fn forget_sessions(&self, engine: Kind, deleted: &[String]) -> io::Result<()> {
         let _guard = self.sessions_lock.lock().unwrap();
-        let mut all = self.sessions();
+        let mut all = self.sessions(engine);
         all.retain(|id, _| !deleted.contains(id));
-        write_atomic(&self.sessions_file(), &serde_json::to_vec_pretty(&all)?)?;
+        write_atomic(&self.sessions_file(engine), &serde_json::to_vec_pretty(&all)?)?;
         for entry in fs::read_dir(self.dir.join("scopes"))?.filter_map(Result::ok) {
             let Ok(bytes) = fs::read(entry.path()) else { continue };
             let Ok(mut b) = serde_json::from_slice::<Binding>(&bytes) else { continue };
-            if b.engine.as_deref().unwrap_or("codex") == self.engine && b.session.as_ref().is_some_and(|s| deleted.contains(s)) {
+            if b.engine.as_deref().unwrap_or("codex") == engine.id() && b.session.as_ref().is_some_and(|s| deleted.contains(s)) {
                 b.session = None;
                 write_atomic(&entry.path(), &serde_json::to_vec(&b)?)?;
             }
@@ -300,8 +301,9 @@ mod tests {
         let claude = Cache::open(dir.join(".cxplr"), Kind::Claude, None).unwrap();
         assert_eq!(claude.state(&repo, "a"), Some("stale"));
         assert_eq!(claude.session("a"), None);
-        cache.record_session("session-a", "A").unwrap();
-        assert!(claude.sessions().is_empty());
+        cache.record_session(Kind::Codex, "session-a", "A").unwrap();
+        assert!(cache.sessions(Kind::Claude).is_empty());
+        assert_eq!(cache.sessions(Kind::Codex).len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

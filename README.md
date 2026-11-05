@@ -22,11 +22,17 @@ cited source lines, in a local web UI.
   so your other sessions can use it.
 - **Native Claude**: Anthropic Messages streaming with browser OAuth login or an API
   key, repository-confined tools and persisted conversations—no agent CLI required.
+- **Any OpenAI-compatible model**: the same built-in agent over Chat Completions, for
+  OpenAI, OpenRouter, vLLM, llama.cpp, Ollama, LM Studio and the like, local or remote.
+- **Separate models for indexing and questions**, e.g. a cheap or local model for the
+  maps and a stronger one for questions, whose sessions start from the atlas.
+- **Guided setup**: `cxplr --configure` (also on first launch) picks and checks the
+  engines and models and saves them globally.
 
 The exploration is done by [Codex](https://github.com/openai/codex) (default),
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code), or a native Anthropic
-Messages client, in read-only sessions that form a tree mirroring the map
-(see [Engines](#engines) and [Sessions](#sessions)).
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code), a native Anthropic
+Messages client, or any OpenAI-compatible model, in read-only sessions that form a tree
+mirroring the map (see [Engines](#engines) and [Sessions](#sessions)).
 
 ## Requirements
 
@@ -36,22 +42,55 @@ Messages client, in read-only sessions that form a tree mirroring the map
   - `claude` (Claude Code) on `PATH`, with `--restricted` (Claude Code 2.1.3xx;
     `claude update` otherwise), for `--engine claude`, or
   - an Anthropic API key or Claude subscription OAuth login for `--engine anthropic`;
-    neither agent CLI is needed (see [Native Anthropic](#native-anthropic)).
+    neither agent CLI is needed (see [Native Anthropic](#native-anthropic)), or
+  - an OpenAI-compatible server whose model supports tool calling, for `--engine openai`
+    (see [OpenAI-compatible](#openai-compatible)).
 
   cxplr stops with a clear error if the selected CLI is missing or too old. CLI model
   and reasoning settings come from that engine's config unless `--model` is given.
 - Optional: language servers for code navigation (see [Source viewer](#source-viewer)).
 
+## Configuration
+
+`cxplr --configure` sets up the global configuration interactively. The first
+interactive launch without a configuration runs it too, then carries on with the
+command you started.
+
+1. **Engine that makes the maps.** Each engine is listed with what was found: `codex`
+   and whether it is logged in, `claude`, a Claude sign-in or key for `anthropic`
+   (offering the browser sign-in when there is none), and the server for `openai`.
+2. **Its model.** For `openai`: the server URL, an optional API key (typed hidden), then
+   the models the server lists, by number or name. A server with one model needs no
+   choice.
+3. **Optionally, another engine or model for questions, example inputs and
+   walkthroughs** (see [Separate models](#separate-models-for-indexing-and-questions)).
+
+The result goes to `$XDG_CONFIG_HOME/cxplr/config.toml` (default
+`~/.config/cxplr/config.toml`), written with mode 0600 because it can hold an API key:
+
+```toml
+engine = "openai"
+ask_engine = "codex"
+openai_base_url = "http://localhost:8080"
+```
+
+Keys: `engine`, `model`, `ask_engine`, `ask_model`, `openai_base_url`, `openai_api_key`.
+Command-line flags override them, and `$OPENAI_BASE_URL`, `$OPENAI_API_KEY` and
+`$OPENAI_MODEL` override the OpenAI settings. A configured model belongs to its engine:
+`--engine claude` with a configured `openai` model uses Claude's default, not that
+model. Runs without a terminal (services, CI) or with engine flags never start the
+wizard; without a configuration they use Codex.
+
 ## Engines
 
-| | `--engine codex` (default) | `--engine claude` | `--engine anthropic` |
-| --- | --- | --- | --- |
-| Runs | one long-lived `codex app-server` | `claude -p` per turn | native Rust agent and Anthropic Messages streaming |
-| Account | your Codex login | your Claude Code login | cxplr OAuth login, OAuth access token, or Anthropic API key |
-| Tools | read-only shell commands | `Read`, `Grep`, `Glob` | bounded file reads, regex search, globs and directory listings |
-| Isolation | read-only sandbox, approvals off, integrations disabled | restricted tools, no MCP servers or user/project settings | no shell, code execution, hooks, plugins or project configuration; tools confined to the repository |
-| Sessions | Codex threads (`codex resume <id>`) | Claude Code sessions (`claude --resume <id>`) | private JSON histories in the cache; resumed by cxplr |
-| `--model` | Codex model | Claude model or alias (`sonnet`, `opus`, …) | full Anthropic model id; default `claude-sonnet-5-5` |
+| | `--engine codex` (default) | `--engine claude` | `--engine anthropic` | `--engine openai` |
+| --- | --- | --- | --- | --- |
+| Runs | one long-lived `codex app-server` | `claude -p` per turn | native Rust agent and Anthropic Messages streaming | the same native agent over Chat Completions |
+| Account | your Codex login | your Claude Code login | cxplr OAuth login, OAuth access token, or Anthropic API key | `$OPENAI_API_KEY`, if the server needs one |
+| Tools | read-only shell commands | `Read`, `Grep`, `Glob` | bounded file reads, regex search, globs and directory listings | same as `anthropic` |
+| Isolation | read-only sandbox, approvals off, integrations disabled | restricted tools, no MCP servers or user/project settings | no shell, code execution, hooks, plugins or project configuration; tools confined to the repository | same as `anthropic` |
+| Sessions | Codex threads (`codex resume <id>`) | Claude Code sessions (`claude --resume <id>`) | private JSON histories in the cache; resumed by cxplr | same as `anthropic` |
+| `--model` | Codex model | Claude model or alias (`sonnet`, `opus`, …) | full Anthropic model id; default `claude-sonnet-5-5` | model id; default `$OPENAI_MODEL` or the server's only model |
 
 ```sh
 cxplr --engine claude --index      # map the project with Claude Code
@@ -61,6 +100,30 @@ cxplr --engine claude --model opus # browse and ask with Opus
 Each engine has its own cache keys and sessions: maps made with one show as stale under
 the other until refreshed, and sessions are never shared across engines. Maps made by
 Codex before this option existed keep their keys.
+
+### Separate models for indexing and questions
+
+Indexing reads a lot of code and runs once; questions need careful reasoning but read
+little. `--ask-engine` and `--ask-model` give questions, example inputs and code
+walkthroughs their own engine or model, while `--engine` / `--model` make the maps:
+
+```sh
+# map with a local model, ask with Codex
+cxplr --engine openai --openai-base-url http://localhost:8080 --ask-engine codex --index
+# cheaper model for the index, stronger one for questions
+cxplr --engine claude --model sonnet --ask-model opus
+```
+
+Without them, questions fork the session of the map you are viewing, which has already
+read that code. With another engine or model, that session cannot be reused (it belongs
+to another engine, or its prompt cache is for another model), so each new conversation,
+example run and walkthrough starts a session seeded with the atlas instead: the pages of
+the system map, the maps above the current one and the current map (about 60k
+characters at most, keeping the system and current pages first). Follow-ups continue
+that session. In the A/B test this used fewer tokens than forking the index session,
+with answers as good. `--ask-model` alone switches the model on the indexing engine;
+`--ask-engine` alone uses that engine's default model. Cache keys depend only on the
+indexing engine and model, so changing the ask side never invalidates maps.
 
 ### Native Anthropic
 
@@ -109,6 +172,37 @@ Final answers are schema-validated before cxplr verifies their citations. Usage
 totals include uncached input, cache writes and cache reads; the displayed cached
 portion is cache reads only.
 
+### OpenAI-compatible
+
+`--engine openai` runs the same built-in agent as `--engine anthropic` (same tools,
+histories, forks and answer checks) against any server that implements the Chat
+Completions API with function calling:
+
+```sh
+# a local llama.cpp, vLLM, Ollama or LM Studio server
+cxplr --engine openai --openai-base-url http://localhost:8080 --index
+
+# OpenAI, or any hosted provider with an OpenAI-compatible API
+export OPENAI_API_KEY='your-api-key'
+cxplr --engine openai --model gpt-5.1 --index
+OPENAI_API_KEY="$OPENROUTER_API_KEY" cxplr --engine openai \
+  --openai-base-url https://openrouter.ai/api/v1 --model qwen/qwen3-coder --index
+```
+
+- **Base URL**: `--openai-base-url`, else `$OPENAI_BASE_URL`, else
+  `https://api.openai.com/v1`. A bare host (`http://host:8080`) gets `/v1`; a URL with
+  a path is used as given. Requests go to `<base>/chat/completions`.
+- **Model**: `--model`, else `$OPENAI_MODEL`, else the server's model when
+  `<base>/models` lists exactly one (typical for local servers); otherwise cxplr lists
+  the choices and stops. The model is part of the cache keys.
+- **Key**: `$OPENAI_API_KEY`, sent as a bearer token when set; local servers usually
+  need none.
+- The model needs tool calling (for llama.cpp, start `llama-server` with `--jinja`). If
+  it writes the final JSON as text instead of calling `_answer`, cxplr accepts it when it
+  matches the schema, and otherwise asks again up to twice.
+- Reasoning text (`reasoning_content`) is shown as progress but not sent back. Usage is
+  read from the response; cached prompt tokens appear when the server reports them.
+- Repository code and tool outputs go to whatever server the URL points at.
 
 ## Install
 
@@ -129,7 +223,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.9.0 is available (you have 0.8.0): run `cxplr --update`
+cxplr 0.10.0 is available (you have 0.9.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -144,8 +238,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.9.0"
-git tag v0.9.0 && git push origin main v0.9.0
+cargo build && git commit -am "Release 0.10.0"
+git tag v0.10.0 && git push origin main v0.10.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -423,15 +517,18 @@ flowchart TD
 - A stale map is refreshed **inside its own session**: the agent gets the exact list of
   changed files, re-reads them and returns the updated map instead of exploring from
   scratch. If that session no longer exists, the map is explored afresh.
-- Questions and example inputs fork the session of the map you are viewing.
+- Questions, example inputs and walkthroughs fork the session of the map you are
+  viewing, or, with `--ask-engine` / `--ask-model`, start a session seeded with the atlas
+  (see [Separate models](#separate-models-for-indexing-and-questions)).
 - CLI sessions are persisted by their agent and named `cxplr: <repo> › …`. Each map
   shows its session id; `codex resume <id>` or `claude --resume <id>` (from the
   repository directory) continues a CLI session interactively. With Claude Code,
   cxplr picks each id and creates a fork on its first turn.
-- Native Anthropic sessions are private JSON histories in
-  `<cache>/anthropic-sessions/`. Forks copy the parent's completed exchanges;
-  follow-ups and refreshes resume them, including after restarting cxplr. They are
-  not Claude Code transcripts and cannot be opened with `claude --resume`.
+- Native Anthropic and OpenAI-compatible sessions are private JSON histories in
+  `<cache>/anthropic-sessions/` and `<cache>/openai-sessions/`. Forks copy the parent's
+  completed exchanges; follow-ups and refreshes resume them, including after
+  restarting cxplr. They are not Claude Code transcripts and cannot be opened with
+  `claude --resume`.
 - `--forget-sessions` deletes every session of the selected engine that cxplr created
   for the project; cached maps stay, and later work starts new sessions.
 
@@ -447,8 +544,8 @@ checkouts.
 | `scopes/<hash>.json` | Latest map of a scope: its paths, file manifest and session |
 | `traces/<key>.json` | Example inputs per map content and flow |
 | `walks/<key>.json` | Code walkthrough per example input |
-| `sessions.json`, `sessions-claude.json`, `sessions-anthropic.json` | Per-engine session registries (for `--forget-sessions`) |
-| `anthropic-sessions/<id>.json` | Private native Anthropic conversation histories |
+| `sessions.json`, `sessions-claude.json`, `sessions-anthropic.json`, `sessions-openai.json` | Per-engine session registries (for `--forget-sessions`) |
+| `anthropic-sessions/<id>.json`, `openai-sessions/<id>.json` | Private conversation histories of the built-in agent |
 | `atlas/` | The Markdown atlas |
 
 A map's key is its scope plus the content of every file it covers (git blob hashes of
@@ -498,8 +595,11 @@ cxplr [REPO] [OPTIONS]
 | `--port N` | 7878 | Web UI port |
 | `--host ADDR` | 127.0.0.1 | Address to listen on; keep it on loopback |
 | `--open` | | Open the browser once serving (always after `--index`) |
-| `--engine codex\|claude\|anthropic` | `codex` | Agent that explores (see [Engines](#engines)) |
-| `--model NAME` | CLI config / `claude-sonnet-5-5` | Model; CLI Claude also takes aliases (`sonnet`, `opus`) |
+| `--engine codex\|claude\|anthropic\|openai` | configured, else `codex` | Agent that explores (see [Engines](#engines)) |
+| `--model NAME` | CLI config / `claude-sonnet-5-5` / `$OPENAI_MODEL` | Model; CLI Claude also takes aliases (`sonnet`, `opus`) |
+| `--openai-base-url URL` | `$OPENAI_BASE_URL` or OpenAI | OpenAI-compatible API root for `--engine openai`; key from `$OPENAI_API_KEY` |
+| `--ask-engine ENGINE` | `--engine` | Engine for questions, example inputs and walkthroughs |
+| `--ask-model NAME` | `--model` (same engine) | Model for questions, example inputs and walkthroughs |
 | `--codex PATH` | `codex` | Codex executable (run as `codex app-server`) |
 | `--claude PATH` | `claude` | Claude Code executable (run as `claude -p`) |
 | `--anthropic-login` | | Browser OAuth login for native Anthropic; saves refreshable credentials and exits |
@@ -510,5 +610,6 @@ cxplr [REPO] [OPTIONS]
 | `--lsp-import-build` | | Let Metals import the Scala build for full navigation (runs the build tool) |
 | `--forget-sessions` | | Delete the selected engine's sessions cxplr created for `REPO` and exit |
 | `--install-skill` | | Install the cxplr skill for the selected engine and exit |
+| `--configure` | | Set up the global configuration interactively and exit (see [Configuration](#configuration)) |
 | `--update` | | Install the latest release now (installer installs) and exit |
 | `--no-update` | | Skip the check for a newer release (also `CXPLR_NO_UPDATE=1`) |

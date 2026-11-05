@@ -177,14 +177,9 @@ fn client_id() -> String {
     String::from_utf8(STANDARD.decode(CLIENT_ID_B64).expect("valid client id")).expect("utf-8 client id")
 }
 
-/// `$XDG_CONFIG_HOME/cxplr/anthropic.json`, else `$HOME/.config/cxplr/anthropic.json`.
+/// `<config dir>/anthropic.json` (see [`crate::config::dir`]).
 pub fn credentials_path() -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .ok_or("cannot locate a config directory: set XDG_CONFIG_HOME or HOME")?;
-    Ok(base.join("cxplr").join("anthropic.json"))
+    Ok(crate::config::dir()?.join("anthropic.json"))
 }
 
 fn read_stored(path: &Path) -> Result<Option<Stored>, String> {
@@ -690,7 +685,7 @@ fn parse_manual(input: &str, expected_state: &str) -> Result<String, &'static st
 async fn wait_for_code(listeners: Vec<TcpListener>, state: &str) -> Result<String, String> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let servers: Vec<_> = listeners.into_iter().map(|l| tokio::spawn(serve_callback(l, state.to_owned(), tx.clone()))).collect();
-    let _hidden = EchoGuard::hide();
+    let _hidden = crate::term::EchoGuard::hide();
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -725,53 +720,6 @@ async fn wait_for_code(listeners: Vec<TcpListener>, state: &str) -> Result<Strin
         server.abort();
     }
     result
-}
-
-/// Hides typed/pasted input on an interactive terminal; restores on drop.
-struct EchoGuard {
-    #[cfg(unix)]
-    saved: Option<libc::termios>,
-}
-
-impl EchoGuard {
-    fn hide() -> Self {
-        Self {
-            #[cfg(unix)]
-            saved: hide_echo(),
-        }
-    }
-}
-
-/// Turns off echo (keeping the newline echo) when stdin is a terminal; returns
-/// the attributes to restore.
-#[cfg(unix)]
-fn hide_echo() -> Option<libc::termios> {
-    // SAFETY: termios calls on stdin with a zeroed, then kernel-filled struct.
-    unsafe {
-        if libc::isatty(libc::STDIN_FILENO) != 1 {
-            return None;
-        }
-        let mut term: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
-            return None;
-        }
-        let saved = term;
-        term.c_lflag &= !libc::ECHO;
-        term.c_lflag |= libc::ECHONL;
-        (libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) == 0).then_some(saved)
-    }
-}
-
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(saved) = self.saved {
-            // SAFETY: restores the attributes read in `hide`.
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

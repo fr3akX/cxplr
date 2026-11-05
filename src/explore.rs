@@ -3,20 +3,26 @@
 //!
 //! Sessions mirror the map tree: the system map is explored in a new session,
 //! each component in a fork of its parent's session, and a stale map is
-//! refreshed inside the session that made it.
+//! refreshed inside the session that made it. Questions, example inputs and
+//! walkthroughs fork the viewed map's session too, unless a separate ask engine or
+//! model is set: then they start a session seeded with the atlas instead.
 
 use crate::cache::{Cache, Freshness};
 use crate::engine::{self, Engine};
 use crate::map::{self, Map, Meta, Node};
 use crate::repo::Repo;
-use crate::{prompt, verify};
+use crate::{atlas, prompt, verify};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 pub struct Explorer {
     pub repo: Repo,
     pub cache: Cache,
+    /// Makes and refreshes maps.
     pub engine: Engine,
+    /// Answers questions and writes example inputs and walkthroughs when it differs
+    /// from `engine` (another engine or model); `None` means `engine` does both.
+    pub asker: Option<Engine>,
 }
 
 /// Everything needed to explore a scope below the system map.
@@ -95,7 +101,30 @@ impl Explorer {
 
     fn record(&self, id: &str, name: &str) {
         // Losing the registry entry only means `--forget-sessions` misses it.
-        let _ = self.cache.record_session(id, name);
+        let _ = self.cache.record_session(self.engine.kind(), id, name);
+    }
+
+    /// The engine for questions, example inputs and walkthroughs.
+    pub fn ask_engine(&self) -> &Engine {
+        self.asker.as_ref().unwrap_or(&self.engine)
+    }
+
+    /// A session for a question, example inputs or a walkthrough about `scope`, and
+    /// the context to put in front of its first prompt. The indexing engine forks the
+    /// scope's map session, which has already read that code. A separate ask engine or
+    /// model cannot use that session (another engine, or a model with a cold prompt
+    /// cache), so it starts a new one seeded with the atlas pages down to `scope`.
+    pub async fn ask_session(&self, scope: &str, name: &str, progress: &mut impl FnMut(String)) -> Result<(String, Option<String>), String> {
+        let Some(asker) = &self.asker else {
+            return Ok((self.session_from(Some(scope), name, progress).await?, None));
+        };
+        let id = asker.start_session(name).await?;
+        let _ = self.cache.record_session(asker.kind(), &id, name);
+        let context = atlas::context(&self.cache, scope);
+        let model = asker.model().map_or(String::new(), |m| format!(", {m}"));
+        let seed = if context.is_some() { "seeded with the atlas" } else { "no atlas pages to seed it with" };
+        progress(format!("New {}{model} session {id}, {seed}", asker.kind().id()));
+        Ok((id, context))
     }
 
     /// Explore a scope, verify the answer and store it in the cache.

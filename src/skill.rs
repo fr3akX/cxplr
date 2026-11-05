@@ -39,6 +39,9 @@ fn skill_path(engine: Kind) -> io::Result<PathBuf> {
     let (var, default) = match engine {
         Kind::Codex => ("CODEX_HOME", ".codex"),
         Kind::Claude | Kind::Anthropic => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Kind::OpenAi => {
+            return Err(io::Error::other("the openai engine is cxplr's own agent and has no skill directory; install the skill for codex or claude instead"))
+        }
     };
     let home = env::var_os(var)
         .filter(|v| !v.is_empty())

@@ -27,13 +27,14 @@ function esc(text) {
   return String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
-/** The agent that explores, as named in the UI. */
-function engineName() {
-  return { codex: 'Codex', claude: 'Claude Code', anthropic: 'Claude (native)' }[state.repo?.engine] || 'Codex';
+/** The agent that makes maps (`index`) or answers questions, examples and walkthroughs (`ask`). */
+function engineName(role = 'index') {
+  const id = role === 'ask' ? state.repo?.ask_engine || state.repo?.engine : state.repo?.engine;
+  return { codex: 'Codex', claude: 'Claude Code', anthropic: 'Claude (native)', openai: 'OpenAI-compatible model' }[id] || 'Codex';
 }
 
 function sessionHint(meta) {
-  if (meta.engine === 'anthropic') return 'Native Anthropic session; follow-ups and refresh resume it through cxplr';
+  if (meta.engine === 'anthropic' || meta.engine === 'openai') return 'cxplr session; follow-ups and refresh resume it through cxplr';
   return `Continue it in a terminal: ${meta.engine === 'claude' ? 'claude --resume' : 'codex resume'} ${meta.session}`;
 }
 
@@ -1096,17 +1097,17 @@ function renderTraceBox(t) {
     box.innerHTML = `${t.error ? `<p class="error-text">${esc(t.error)}</p>` : ''}
       <p class="meta">Concrete inputs that take different branches through this flow, with the data at every hop and the code that decides it.</p>
       <div class="actions"><button type="button" data-trace-gen>Generate example inputs</button></div>
-      <p class="meta">Runs ${esc(engineName())} read-only (about 1–3 minutes); the result is cached with the map.</p>`;
+      <p class="meta">Runs ${esc(engineName('ask'))} read-only (about 1–3 minutes); the result is cached with the map.</p>`;
     return;
   }
   if (t.status === 'running') {
-    box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName())} is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
+    box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
       <button type="button" data-trace-cancel>Cancel</button></div>${t.last ? `<div class="last">${esc(t.last)}</div>` : ''}</div>`;
     return;
   }
   const { scenarios, meta, diagnostics } = t.traces;
   if (!scenarios.length) {
-    box.innerHTML = `<p class="muted">${esc(engineName())} returned no scenario on this map.</p><div class="actions"><button type="button" data-trace-gen>Try again</button></div>`;
+    box.innerHTML = `<p class="muted">${esc(engineName('ask'))} returned no scenario on this map.</p><div class="actions"><button type="button" data-trace-gen>Try again</button></div>`;
     return;
   }
   box.innerHTML = `<div class="actions" style="margin-top:0"><button type="button" class="primary" data-trace-play>▶ Play ${scenarios.length} examples</button>
@@ -1225,13 +1226,13 @@ function renderWalkStatus(k) {
   if (!el) return;
   const w = walkState.get(walkId(k));
   if (w?.status === 'running') {
-    el.innerHTML = `<div class="status"><div class="spinner"></div><span>${esc(engineName())} is walking the code… ${fmtDuration(w.elapsed || 0)}</span>
+    el.innerHTML = `<div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is walking the code… ${fmtDuration(w.elapsed || 0)}</span>
       <button type="button" data-walk-cancel="${k}">Cancel</button></div>${w.last ? `<div class="last">${esc(w.last)}</div>` : ''}`;
     return;
   }
   const ready = w?.status === 'ready';
   const steps = ready ? w.walk.steps.length : 0;
-  el.innerHTML = `<button type="button" data-walk="${k}" title="${ready ? 'Step through the code this input runs' : `Follow this input through the code, step by step (${esc(engineName())}, read-only, about 1–3 minutes; cached with the map)`}">
+  el.innerHTML = `<button type="button" data-walk="${k}" title="${ready ? 'Step through the code this input runs' : `Follow this input through the code, step by step (${esc(engineName('ask'))}, read-only, about 1–3 minutes; cached with the map)`}">
       ${ready ? `Step through code · ${steps} steps` : 'Walk through code'}</button>
     ${w?.status === 'failed' ? `<span class="error-text">${esc(w.error)}</span>` : ''}`;
 }
@@ -2663,8 +2664,8 @@ function askContext() {
   const crumbs = state.map?.meta?.crumbs?.join(' › ') || state.repo?.name || 'repository';
   chips.push(`<span class="chip">Map <b>${esc(crumbs)}</b></span>`);
   chips.push(mainConv.session
-    ? `<span class="chip" title="Follow-ups continue ${esc(engineName())} session ${esc(mainConv.session)}">Conversation <b>continues</b><button type="button" data-new-conv title="Start a new conversation from the current map's session">✕</button></span>`
-    : '<span class="chip" title="The first question forks the session that explored this map">Conversation <b>new</b></span>');
+    ? `<span class="chip" title="Follow-ups continue ${esc(engineName('ask'))} session ${esc(mainConv.session)}">Conversation <b>continues</b><button type="button" data-new-conv title="Start a new conversation">✕</button></span>`
+    : `<span class="chip" title="${state.repo?.ask_seeded ? `The first question starts a new ${esc(engineName('ask'))} session seeded with the atlas` : 'The first question forks the session that explored this map'}">Conversation <b>new</b></span>`);
   const node = state.selected?.type === 'node' ? nodeById(state.selected.id) : null;
   if (node) {
     ctx.node = node.id;
@@ -2684,7 +2685,7 @@ $('#ask-context').addEventListener('click', (e) => {
 function renderEntry(entry, convId) {
   const q = `<div class="msg-q">${esc(entry.question)}</div><div class="msg-ctx">${esc(entry.label)}</div>`;
   if (entry.status === 'running') {
-    return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName())} is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
+    return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName('ask'))} is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
       <button type="button" data-cancel="${entry.job}">Cancel</button></div>${entry.last ? `<div class="last">${esc(entry.last)}</div>` : ''}</div>`;
   }
   if (entry.status !== 'done') {
@@ -2833,7 +2834,7 @@ window.addEventListener('keydown', (e) => {
     state.repo = await api('/api/repo');
     $('#repo').textContent = `${state.repo.root}${state.repo.commit ? ` @ ${state.repo.commit.slice(0, 10)}` : ''}`;
     $('#repo').title = $('#repo').textContent;
-    document.querySelectorAll('[data-engine-name]').forEach((el) => { el.textContent = engineName(); });
+    document.querySelectorAll('[data-engine-name]').forEach((el) => { el.textContent = engineName('ask'); });
   } catch (err) {
     return showError(err.message, '');
   }
