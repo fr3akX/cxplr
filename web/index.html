@@ -57,15 +57,30 @@
   </main>
   <div id="modal" hidden>
     <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="src-path">
+      <div id="src-tabs" role="tablist" aria-label="Open files"></div>
       <div class="modal-head">
         <button id="src-back" type="button" title="Back (Alt+←)" disabled>‹</button>
         <button id="src-fwd" type="button" title="Forward (Alt+→)" disabled>›</button>
+        <button id="src-outline-btn" type="button" title="Functions and classes in this file">Outline</button>
         <span id="src-path"></span>
         <span id="src-lsp" class="lsp-chip" hidden></span>
+        <div class="find">
+          <input id="find-q" type="search" placeholder="Find (Ctrl+F)" spellcheck="false" autocomplete="off"
+            title="Enter: next · Shift+Enter: previous · Alt+Enter: search the repository · ignores case unless the query has capitals">
+          <span id="find-count"></span>
+          <button id="find-prev" type="button" title="Previous match (Shift+Enter)">↑</button>
+          <button id="find-next" type="button" title="Next match (Enter)">↓</button>
+          <button id="find-repo" type="button" title="Search the whole repository (Alt+Enter)">In repo</button>
+        </div>
         <button id="src-ask" type="button" title="Ask about the selected lines (or the whole file)">Ask about selection</button>
-        <button id="src-close" type="button" title="Close (Esc)">Close</button>
+        <button id="src-close" type="button" title="Close (Esc); open tabs are kept">Close</button>
       </div>
       <div class="modal-main">
+        <nav id="outline" hidden>
+          <input id="ol-filter" type="search" placeholder="Filter functions, classes…" spellcheck="false" autocomplete="off">
+          <ul id="ol-list"></ul>
+          <div id="ol-foot"></div>
+        </nav>
         <div id="src-body"></div>
         <div id="sym" hidden></div>
       </div>

@@ -1321,69 +1321,193 @@ function mdBlock(text) {
 
 // ---------- source viewer (L3) with navigation ----------
 
-const viewer = { path: null, line: 0, history: [], index: -1, lsp: null, lines: [] };
+/**
+ * The viewer keeps one tab per open file. A tab's pane stays rendered while other
+ * tabs are shown, so switching back restores its scroll position and inline threads.
+ * History is shared across tabs; each entry records where the view was when left.
+ */
+const viewer = {
+  tabs: [],
+  active: null,
+  history: [],
+  index: -1,
+  outlineOpen: localStorage.getItem('cxplr:outline') !== 'off',
+  get path() { return this.active?.path ?? null; },
+  get lines() { return this.active?.lines ?? []; },
+  get lsp() { return this.active?.lsp ?? null; },
+};
+const MAX_TABS = 20;
+let tabSeq = 0;
 
 function updateHistoryButtons() {
   $('#src-back').disabled = viewer.index <= 0;
   $('#src-fwd').disabled = viewer.index >= viewer.history.length - 1;
 }
 
-/** Open a file (or directory) at a 1-based line. History entries are pushed unless navigating it. */
-async function openSource(path, line, { push = true } = {}) {
-  if ($('#modal').hidden) { viewer.history = []; viewer.index = -1; }
+/** A tab's line element, 1-based. */
+function lineEl(tab, n) {
+  return tab?.lineEls?.[n - 1] || null;
+}
+
+function renderSrcPath() {
+  const t = viewer.active;
+  if (!t) { $('#src-path').innerHTML = ''; return; }
+  const parts = t.path === '.' ? [] : t.path.split('/');
+  $('#src-path').innerHTML = [`<a data-open=".">${esc(state.repo?.name || '.')}</a>`, ...parts.map((p, i) =>
+    i === parts.length - 1 ? esc(p) : `<a data-open="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</a>`)].join(' / ') + (t.line ? `:${t.line}` : '');
+}
+
+function renderTabs() {
+  $('#src-tabs').innerHTML = viewer.tabs.map((t) => {
+    const name = t.path === '.' ? (state.repo?.name || '.') : t.path.split('/').pop();
+    const notes = threads.filter((c) => c.path === t.path && !c.hidden).length;
+    return `<div class="src-tab${t === viewer.active ? ' active' : ''}" role="tab" data-tab-id="${t.id}" title="${esc(t.path)}">` +
+      `<span class="name">${esc(name)}${t.dir ? '/' : ''}</span>` +
+      (notes ? `<span class="tab-dot" title="${notes} code thread${notes === 1 ? '' : 's'}">●</span>` : '') +
+      `<button type="button" data-tab-close title="Close tab (middle-click)">✕</button></div>`;
+  }).join('');
+  $('#src-tabs .src-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+/** Record the scroll position of the location being left, so Back returns exactly there. */
+function rememberScroll() {
+  const t = viewer.active;
+  if (!t) return;
+  t.top = $('#src-body').scrollTop;
+  const here = viewer.history[viewer.index];
+  if (here?.path === t.path) here.top = t.top;
+}
+
+function activate(t) {
+  const body = $('#src-body');
+  if (viewer.active && viewer.active !== t) {
+    viewer.active.top = body.scrollTop;
+    viewer.active.el.hidden = true;
+  }
+  viewer.active = t;
+  t.used = ++tabSeq;
+  t.el.hidden = false;
+  body.scrollTop = t.top;
+  renderTabs();
+  renderSrcPath();
+  renderLspChip();
+  renderOutline();
+  runFind(false);
+}
+
+function newTab(path) {
+  const el = document.createElement('div');
+  el.className = 'src-pane';
+  el.hidden = true;
+  $('#src-body').append(el);
+  const t = { id: `tab${++tabSeq}`, used: tabSeq, path, line: 0, el, lines: [], lineEls: [], dir: false, lsp: null, outline: [], outlineFrom: null, lspOutline: false, top: 0 };
+  viewer.tabs.push(t);
+  if (viewer.tabs.length > MAX_TABS) {
+    const stale = viewer.tabs.filter((x) => x !== t && x !== viewer.active).sort((a, b) => a.used - b.used)[0];
+    if (stale) closeTab(stale);
+  }
+  return t;
+}
+
+function closeTab(t) {
+  const i = viewer.tabs.indexOf(t);
+  if (i < 0) return;
+  viewer.tabs.splice(i, 1);
+  t.el.remove();
+  if (viewer.active !== t) return renderTabs();
+  viewer.active = null;
+  const next = viewer.tabs[Math.min(i, viewer.tabs.length - 1)];
+  if (next) return openSource(next.path, next.line, { top: next.top });
+  viewer.history = [];
+  viewer.index = -1;
+  closeSource();
+}
+
+/** Fetch and render a tab's file or directory listing. */
+async function loadTab(t) {
+  t.el.innerHTML = '<p class="muted" style="padding:16px">Loading…</p>';
+  let res;
+  try {
+    res = await api(`/api/source?path=${encodeURIComponent(t.path)}`);
+  } catch (err) {
+    t.el.innerHTML = `<div class="src-error">${esc(err.message)}</div>`;
+    return;
+  }
+  if (res.dir) {
+    t.dir = true;
+    const base = res.path === '.' ? '' : `${res.path}/`;
+    t.el.innerHTML = '<ul class="dir-list">' + res.entries.map((e) =>
+      `<li><a data-open="${esc(base + e.name)}">${esc(e.name)}${e.dir ? '/' : ''}</a></li>`).join('') + '</ul>';
+    renderTabs();
+    return;
+  }
+  const text = res.text.endsWith('\n') ? res.text.slice(0, -1) : res.text;
+  t.lines = text.split('\n');
+  const html = highlightLines(text, t.path);
+  t.el.innerHTML = `<div class="src-hint">Click a name for its definition, documentation and references · Ctrl/⌘-click jumps to the definition · Ctrl/⌘+F finds · Alt+←/→ history</div>` +
+    html.map((h, i) => `<div class="src-line" data-line="${i + 1}"><span class="no">${i + 1}</span><span class="code">${h || ' '}</span></div>`).join('');
+  t.lineEls = [...t.el.querySelectorAll('.src-line')];
+  t.outline = guessOutline(t.lines, t.path);
+  t.outlineFrom = 'patterns';
+  refreshLspStatus(t, true);
+}
+
+function reveal(t, line, top) {
+  t.el.querySelectorAll('.src-line.target').forEach((el) => el.classList.remove('target'));
+  const el = lineEl(t, line);
+  el?.classList.add('target');
+  if (top != null) $('#src-body').scrollTop = top;
+  else el?.scrollIntoView({ block: 'center' });
+}
+
+/**
+ * Show a file (or directory) at a 1-based line in its tab, opening the tab if needed.
+ * `top` restores an exact scroll position (history); otherwise the line is centred.
+ */
+async function openSource(path, line, { push = true, top = null } = {}) {
   if (push) {
+    rememberScroll();
     viewer.history = viewer.history.slice(0, viewer.index + 1);
     viewer.history.push({ path, line });
     viewer.index = viewer.history.length - 1;
   }
   updateHistoryButtons();
-  viewer.path = path;
-  viewer.line = line;
   $('#modal').hidden = false;
   $('#sym').hidden = true;
-  const body = $('#src-body');
-  const parts = path === '.' ? [] : path.split('/');
-  $('#src-path').innerHTML = [`<a data-open=".">${esc(state.repo?.name || '.')}</a>`, ...parts.map((p, i) =>
-    i === parts.length - 1 ? esc(p) : `<a data-open="${esc(parts.slice(0, i + 1).join('/'))}">${esc(p)}</a>`)].join(' / ') + (line ? `:${line}` : '');
-  $('#src-lsp').hidden = true;
-  body.innerHTML = '<p class="muted" style="padding:16px">Loading…</p>';
-  let res;
-  try {
-    res = await api(`/api/source?path=${encodeURIComponent(path)}`);
-  } catch (err) {
-    body.innerHTML = `<div class="src-error">${esc(err.message)}</div>`;
-    return;
+  let t = viewer.tabs.find((x) => x.path === path);
+  const fresh = !t;
+  if (fresh) t = newTab(path);
+  t.line = line;
+  activate(t);
+  if (fresh) {
+    await loadTab(t);
+    if (viewer.active !== t) return;
+    renderOutline();
   }
-  if (viewer.path !== path) return;
-  if (res.dir) {
-    viewer.lines = [];
-    const base = res.path === '.' ? '' : `${res.path}/`;
-    body.innerHTML = '<ul class="dir-list">' + res.entries.map((e) =>
-      `<li><a data-open="${esc(base + e.name)}">${esc(e.name)}${e.dir ? '/' : ''}</a></li>`).join('') + '</ul>';
-    return;
-  }
-  const text = res.text.endsWith('\n') ? res.text.slice(0, -1) : res.text;
-  viewer.lines = text.split('\n');
-  const html = highlightLines(text, path);
-  body.innerHTML = `<div class="src-hint">Click a name for its definition, documentation and references · Ctrl/⌘-click jumps to the definition · Alt+←/→ history</div>` +
-    html.map((h, i) => `<div class="src-line${i + 1 === line ? ' target' : ''}" data-line="${i + 1}" id="L${i + 1}"><span class="no">${i + 1}</span><span class="code">${h || ' '}</span></div>`).join('');
-  const target = line && document.getElementById(`L${line}`);
-  if (target) target.scrollIntoView({ block: 'center' });
-  else body.scrollTop = 0;
-  threads.filter((t) => t.path === path).forEach(mountThread);
-  refreshLspStatus(path, true);
+  threads.filter((c) => c.path === path).forEach(mountThread);
+  reveal(t, line, top);
+  if (fresh) runFind(false);
 }
 
-async function refreshLspStatus(path, start) {
+async function refreshLspStatus(t, start) {
   let status;
   try {
-    status = await api(`/api/lsp/status?path=${encodeURIComponent(path)}${start ? '&start=true' : ''}`);
+    status = await api(`/api/lsp/status?path=${encodeURIComponent(t.path)}${start ? '&start=true' : ''}`);
   } catch {
     status = { state: 'none' };
   }
-  if (viewer.path !== path) return;
-  viewer.lsp = status;
+  if (!viewer.tabs.includes(t)) return;
+  t.lsp = status;
+  if (viewer.active === t) renderLspChip();
+  if (['idle', 'starting', 'indexing'].includes(status.state)) setTimeout(() => refreshLspStatus(t, false), 1500);
+  if (['ready', 'indexing'].includes(status.state) && !t.lspOutline) loadLspOutline(t);
+}
+
+function renderLspChip() {
+  const status = viewer.active?.lsp;
   const chip = $('#src-lsp');
+  chip.hidden = !status;
+  if (!status) return;
   // The server's executable, not wrapper words (`npx -y -p pyright@1 pyright-langserver --stdio`).
   const words = status.server?.split(/\s+/).filter((w) => !w.startsWith('-')) || [];
   const server = (words.find((w) => /langserver|language-server|analyzer|pylsp|gopls|clangd/.test(w)) || words[0] || '').split('/').pop();
@@ -1400,8 +1524,6 @@ async function refreshLspStatus(path, start) {
   chip.title = status.state === 'none'
     ? 'No language server for this file type: navigation uses whole-word text search'
     : status.error || status.server;
-  chip.hidden = false;
-  if (['idle', 'starting', 'indexing'].includes(status.state)) setTimeout(() => refreshLspStatus(path, false), 1500);
 }
 
 /** The identifier under a click point inside a `.code` element, with its UTF-16 column. */
@@ -1484,17 +1606,28 @@ async function showSymbol(sym, { jump = false } = {}) {
   pane.querySelector('[data-text]').onclick = (e) => { e.target.disabled = true; textSearch(sym.word); };
 }
 
-async function textSearch(word) {
+/** Text matches across the repository into the symbol pane: whole words, or smart-case substrings. */
+async function textSearch(query, { word = true } = {}) {
   const box = $('#sym-text');
   if (!box) return;
   box.innerHTML = '<p class="muted">Searching…</p>';
   try {
-    const res = await api(`/api/search?word=${encodeURIComponent(word)}&limit=300`);
+    const res = await api(`/api/search?q=${encodeURIComponent(query)}${word ? '&word=true' : ''}&limit=${word ? 300 : 500}`);
     box.innerHTML = `<h3>Text matches (${res.hits.length}${res.truncated ? '+' : ''})</h3>` +
       locItems(res.hits.map((h) => ({ ...h, display: h.path })), { group: true });
   } catch (err) {
     box.innerHTML = `<p class="src-error" style="padding:0">${esc(err.message)}</p>`;
   }
+}
+
+function repoSearch(query) {
+  if (!query.trim()) return;
+  const pane = $('#sym');
+  pane.hidden = false;
+  const exact = /\p{Lu}/u.test(query);
+  pane.innerHTML = `<div class="sym-head"><code>${esc(query)}</code><span class="spacer"></span><button type="button" data-sym-close title="Close">✕</button></div>` +
+    `<p class="muted small">Across the repository, ${exact ? 'matching case (the query has capitals)' : 'ignoring case'}. Opened files highlight the matches.</p><div id="sym-text"></div>`;
+  textSearch(query, { word: false });
 }
 
 $('#src-body').addEventListener('click', (e) => {
@@ -1518,18 +1651,305 @@ $('#sym').addEventListener('click', (e) => {
 function historyStep(delta) {
   const i = viewer.index + delta;
   if (i < 0 || i >= viewer.history.length) return;
+  rememberScroll();
   viewer.index = i;
-  const { path, line } = viewer.history[i];
-  openSource(path, line, { push: false });
+  const { path, line, top } = viewer.history[i];
+  openSource(path, line, { push: false, top });
 }
 $('#src-back').onclick = () => historyStep(-1);
 $('#src-fwd').onclick = () => historyStep(1);
 
+$('#src-tabs').addEventListener('click', (e) => {
+  const el = e.target.closest('.src-tab');
+  const t = el && viewer.tabs.find((x) => x.id === el.dataset.tabId);
+  if (!t) return;
+  if (e.target.closest('[data-tab-close]')) return closeTab(t);
+  if (t !== viewer.active) openSource(t.path, t.line, { top: t.top });
+});
+$('#src-tabs').addEventListener('auxclick', (e) => {
+  const el = e.button === 1 && e.target.closest('.src-tab');
+  const t = el && viewer.tabs.find((x) => x.id === el.dataset.tabId);
+  if (t) { e.preventDefault(); closeTab(t); }
+});
+
+/** Hide the viewer; tabs, their scroll positions and threads stay for the next file opened. */
 function closeSource() {
+  rememberScroll();
   $('#modal').hidden = true;
-  $('#src-body').innerHTML = '';
   $('#sym').hidden = true;
-  viewer.path = null;
+  selAsk.hidden = true;
+}
+
+// ---------- outline ----------
+
+/** Declarations by language for files without a language server: [pattern, kind]; a `kind` group overrides. */
+const MODIFIERS = '(?:(?:public|private|protected|internal|static|final|abstract|sealed|open|data|inner|partial|override|virtual|async|export|default|suspend|inline|mutating)\\s+)*';
+const OUTLINE_RULES = {
+  rust: [
+    [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern(?:\s+"[^"]*")?)\s+)*fn\s+(?<name>[A-Za-z_]\w*)/, 'function'],
+    [/^\s*(?:pub(?:\([^)]*\))?\s+)?(?<kind>struct|enum|trait|union|mod|type)\s+(?<name>[A-Za-z_]\w*)/],
+    [/^\s*(?:unsafe\s+)?impl\b(?:\s*<[^{]*?>)?\s+(?<name>[^{]+?)\s*(?:\{|\bwhere\b|$)/, 'impl'],
+    [/^\s*macro_rules!\s*(?<name>\w+)/, 'macro'],
+  ],
+  python: [
+    [/^\s*(?:async\s+)?def\s+(?<name>\w+)/, 'function'],
+    [/^\s*class\s+(?<name>\w+)/, 'class'],
+  ],
+  js: [
+    [/^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s*(?<name>[\w$]+)/, 'function'],
+    [/^\s*(?:export\s+(?:default\s+)?)?(?:declare\s+)?(?:abstract\s+)?(?<kind>class|interface|enum|namespace)\s+(?<name>[\w$]+)/],
+    [/^\s*(?:export\s+)?(?:declare\s+)?type\s+(?<name>[\w$]+)\s*(?:<[^=]*>)?\s*=/, 'type'],
+    [/^\s*(?:export\s+)?(?:const|let|var)\s+(?<name>[\w$]+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[\w$]+\s*=>)/, 'function'],
+    [/^\s+(?:(?:public|private|protected|static|async|readonly|override|abstract|get|set)\s+)*(?<name>#?[\w$]+)\s*(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^{]+)?\{\s*$/, 'method'],
+  ],
+  go: [
+    [/^func\s+\([^)]*\)\s*(?<name>\w+)/, 'method'],
+    [/^func\s+(?<name>\w+)/, 'function'],
+    [/^type\s+(?<name>\w+)\s+(?<kind>struct|interface)\b/],
+    [/^type\s+(?<name>\w+)\b/, 'type'],
+  ],
+  jvm: [
+    [new RegExp(`^\\s*${MODIFIERS}(?<kind>class|interface|enum|struct|record|object|trait|protocol|extension)\\s+(?<name>\\w+)`)],
+    [new RegExp(`^\\s*${MODIFIERS}(?:fun|func|def)\\s+(?:<[^>]*>\\s*)?(?:[\\w.]+\\.)?(?<name>\\w+)`), 'function'],
+    [/^\s+(?:(?:public|private|protected|internal|static|final|abstract|synchronized|override|virtual|async|native|default)\s+)+[\w<>[\],.?\s]+?\s+(?<name>\w+)\s*\([^;]*$/, 'method'],
+  ],
+  c: [
+    [/^\s*(?:typedef\s+)?(?<kind>struct|class|enum|union|namespace)\s+(?<name>\w+)\s*(?:[:{]|$)/],
+    [/^[A-Za-z_][\w:<>,*&\s]*?[\s*&](?<name>[A-Za-z_][\w:~]*)\s*\([^;]*$/, 'function'],
+  ],
+  ruby: [
+    [/^\s*def\s+(?:self\.)?(?<name>[\w?!=]+)/, 'method'],
+    [/^\s*(?<kind>class|module)\s+(?<name>[\w:]+)/],
+  ],
+  php: [
+    [/^\s*(?:(?:public|private|protected|static|abstract|final)\s+)*function\s+(?<name>\w+)/, 'function'],
+    [/^\s*(?:abstract\s+|final\s+)?(?<kind>class|interface|trait|enum)\s+(?<name>\w+)/],
+  ],
+  shell: [
+    [/^\s*function\s+(?<name>[\w.:-]+)/, 'function'],
+    [/^\s*(?<name>[\w.:-]+)\s*\(\)\s*\{?/, 'function'],
+  ],
+};
+const OUTLINE_LANG = {
+  rs: 'rust', py: 'python', pyi: 'python', js: 'js', mjs: 'js', cjs: 'js', jsx: 'js', ts: 'js', tsx: 'js', mts: 'js', cts: 'js',
+  go: 'go', java: 'jvm', kt: 'jvm', kts: 'jvm', scala: 'jvm', cs: 'jvm', swift: 'jvm', dart: 'jvm',
+  c: 'c', h: 'c', cc: 'c', cpp: 'c', cxx: 'c', hpp: 'c', hh: 'c', rb: 'ruby', php: 'php',
+  sh: 'shell', bash: 'shell', zsh: 'shell', md: 'markdown', markdown: 'markdown',
+};
+const OUTLINE_KEYWORDS = new Set(['if', 'else', 'for', 'while', 'switch', 'catch', 'return', 'function', 'do', 'new', 'sizeof', 'typeof', 'delete', 'throw', 'case', 'match', 'with']);
+const COMMENT_LINE = /^\s*(?:\/\/|\/\*|\*(?:\s|$)|#)/;
+
+/** Outline from name patterns; nesting follows indentation (Markdown: heading level). */
+function guessOutline(lines, path) {
+  const lang = OUTLINE_LANG[path.split('/').pop().split('.').pop().toLowerCase()];
+  const items = [];
+  if (lang === 'markdown') {
+    let fence = false;
+    lines.forEach((text, i) => {
+      if (/^\s*(```|~~~)/.test(text)) fence = !fence;
+      const m = !fence && text.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+      if (m) items.push({ name: m[2], kind: 'heading', line: i + 1, depth: m[1].length - 1 });
+    });
+    return items;
+  }
+  const rules = OUTLINE_RULES[lang];
+  if (!rules) return items;
+  const indents = [];
+  lines.forEach((text, i) => {
+    if (COMMENT_LINE.test(text)) return;
+    for (const [re, kind] of rules) {
+      const m = text.match(re);
+      const name = m?.groups.name?.trim();
+      if (!name || OUTLINE_KEYWORDS.has(name)) continue;
+      const indent = text.match(/^[ \t]*/)[0].replace(/\t/g, '    ').length;
+      while (indents.length && indents[indents.length - 1] >= indent) indents.pop();
+      const k = m.groups.kind || kind;
+      items.push({ name, kind: k === 'mod' ? 'module' : k, line: i + 1, depth: indents.length });
+      indents.push(indent);
+      break;
+    }
+  });
+  return items;
+}
+
+async function loadLspOutline(t) {
+  t.lspOutline = true;
+  let symbols;
+  try {
+    ({ symbols } = await api(`/api/lsp/outline?path=${encodeURIComponent(t.path)}`));
+  } catch {
+    return; // the pattern outline stays, labelled as such
+  }
+  if (!symbols.length && t.outline.length) return;
+  t.outline = symbols;
+  t.outlineFrom = 'lsp';
+  if (viewer.active === t) renderOutline();
+}
+
+const OUTLINE_BADGES = {
+  function: ['ƒ', 'fn'], method: ['ƒ', 'fn'], constructor: ['ƒ', 'fn'], macro: ['!', 'fn'],
+  class: ['C', 'ty'], struct: ['S', 'ty'], union: ['S', 'ty'], record: ['S', 'ty'], object: ['O', 'ty'], impl: ['⧉', 'ty'],
+  enum: ['E', 'ty'], interface: ['I', 'ty'], trait: ['I', 'ty'], protocol: ['I', 'ty'], extension: ['+', 'ty'], type: ['T', 'ty'],
+  module: ['M', 'mod'], namespace: ['M', 'mod'], package: ['M', 'mod'],
+  variable: ['v', 'val'], constant: ['c', 'val'], heading: ['#', 'doc'],
+};
+
+function renderOutline() {
+  const t = viewer.active;
+  const nav = $('#outline');
+  $('#src-outline-btn').classList.toggle('active', viewer.outlineOpen);
+  nav.hidden = !viewer.outlineOpen || !t || t.dir;
+  if (nav.hidden) return;
+  const filter = $('#ol-filter').value.trim().toLowerCase();
+  const items = t.outline.filter((s) => !filter || s.name.toLowerCase().includes(filter));
+  $('#ol-list').innerHTML = items.map((s) => {
+    const [badge, group] = OUTLINE_BADGES[s.kind] || ['·', 'val'];
+    const title = `${s.kind}${s.detail ? ` · ${s.detail}` : ''} · line ${s.line}`;
+    return `<li data-line="${s.line}" style="padding-left:${6 + Math.min(s.depth, 8) * 12}px" title="${esc(title)}">` +
+      `<span class="ol-badge ol-${group}">${badge}</span><span class="ol-name">${esc(s.name)}</span></li>`;
+  }).join('');
+  const from = t.outlineFrom === 'lsp' ? 'language server' : 'name patterns';
+  $('#ol-foot').textContent = !t.lines.length ? ''
+    : !t.outline.length ? (t.outlineFrom === 'lsp' ? 'No declarations in this file.' : 'No functions or classes recognised.')
+    : `${t.outline.length} symbol${t.outline.length === 1 ? '' : 's'} · ${from}${filter ? ` · ${items.length} shown` : ''}`;
+  markCurrentSymbol();
+}
+
+/** The first source line visible at the top of the viewer. */
+function firstVisibleLine() {
+  const r = $('#src-body').getBoundingClientRect();
+  const el = document.elementFromPoint(r.left + 80, r.top + 30)?.closest('.src-line');
+  return Number(el?.dataset.line) || 1;
+}
+
+/** Mark the declaration the view is in. */
+function markCurrentSymbol() {
+  const t = viewer.active;
+  if ($('#outline').hidden || !t?.outline.length) return;
+  const top = firstVisibleLine();
+  let current = 0;
+  for (const s of t.outline) if (s.line <= top + 1) current = Math.max(current, s.line);
+  $('#ol-list').querySelectorAll('li').forEach((li) => {
+    const on = Number(li.dataset.line) === current;
+    li.classList.toggle('current', on);
+    if (on) li.scrollIntoView({ block: 'nearest' });
+  });
+}
+let outlineFrame = 0;
+$('#src-body').addEventListener('scroll', () => {
+  cancelAnimationFrame(outlineFrame);
+  outlineFrame = requestAnimationFrame(markCurrentSymbol);
+});
+
+$('#ol-list').addEventListener('click', (e) => {
+  const li = e.target.closest('li[data-line]');
+  if (li && viewer.path) openSource(viewer.path, Number(li.dataset.line));
+});
+$('#ol-filter').addEventListener('input', renderOutline);
+$('#ol-filter').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { const li = $('#ol-list li[data-line]'); if (li) openSource(viewer.path, Number(li.dataset.line)); }
+  if (e.key === 'Escape' && e.target.value) { e.stopPropagation(); e.target.value = ''; renderOutline(); }
+});
+$('#src-outline-btn').onclick = () => {
+  viewer.outlineOpen = !viewer.outlineOpen;
+  localStorage.setItem('cxplr:outline', viewer.outlineOpen ? 'on' : 'off');
+  renderOutline();
+};
+
+// ---------- find in file ----------
+
+const MAX_FIND = 5000;
+const find = { q: '', matches: [], ranges: [], index: -1 };
+
+/** Smart case: case-insensitive unless the query has capitals. */
+function findMatches(lines, q) {
+  const fold = !/\p{Lu}/u.test(q);
+  const needle = fold ? q.toLowerCase() : q;
+  const out = [];
+  for (let i = 0; i < lines.length && out.length < MAX_FIND; i++) {
+    const hay = fold ? lines[i].toLowerCase() : lines[i];
+    for (let at = hay.indexOf(needle); at >= 0 && out.length < MAX_FIND; at = hay.indexOf(needle, at + needle.length)) {
+      out.push({ line: i + 1, start: at, end: at + needle.length });
+    }
+  }
+  return out;
+}
+
+/** A DOM range over UTF-16 offsets of a highlighted line's text. */
+function textRange(codeEl, start, end) {
+  const range = document.createRange();
+  const walker = document.createTreeWalker(codeEl, NodeFilter.SHOW_TEXT);
+  let pos = 0;
+  let started = false;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const len = n.nodeValue.length;
+    if (!started && start < pos + len) { range.setStart(n, start - pos); started = true; }
+    if (started && end <= pos + len) { range.setEnd(n, end - pos); return range; }
+    pos += len;
+  }
+  return null;
+}
+
+/** Recompute matches in the active tab; `jump` moves to the first match from the top of the view. */
+function runFind(jump) {
+  const t = viewer.active;
+  find.q = $('#find-q').value;
+  find.matches = t && find.q ? findMatches(t.lines, find.q) : [];
+  find.ranges = find.matches.map((m) => {
+    const code = lineEl(t, m.line)?.querySelector('.code');
+    return code && textRange(code, m.start, m.end);
+  });
+  if (window.CSS?.highlights) CSS.highlights.set('find', new Highlight(...find.ranges.filter(Boolean)));
+  const from = jump ? firstVisibleLine() : (t?.line || firstVisibleLine());
+  find.index = find.matches.length ? Math.max(0, find.matches.findIndex((m) => m.line >= from)) : -1;
+  showFindMatch(jump);
+}
+
+function showFindMatch(scroll) {
+  const n = find.matches.length;
+  $('#find-count').textContent = !find.q ? '' : n ? `${find.index + 1}/${n}${n >= MAX_FIND ? '+' : ''}` : 'no matches';
+  $('#find-q').classList.toggle('none', Boolean(find.q) && !n);
+  document.querySelectorAll('#src-body .src-line.find-line').forEach((el) => el.classList.remove('find-line'));
+  const m = find.matches[find.index];
+  const el = m && lineEl(viewer.active, m.line);
+  el?.classList.add('find-line');
+  if (window.CSS?.highlights) {
+    const current = new Highlight(...(find.ranges[find.index] ? [find.ranges[find.index]] : []));
+    current.priority = 1;
+    CSS.highlights.set('find-current', current);
+  }
+  if (scroll) el?.scrollIntoView({ block: 'center' });
+}
+
+function stepFind(delta) {
+  if ($('#find-q').value !== find.q) return runFind(true);
+  const n = find.matches.length;
+  if (!n) return;
+  find.index = (find.index + delta + n) % n;
+  showFindMatch(true);
+}
+
+let findTimer = 0;
+$('#find-q').addEventListener('input', () => { clearTimeout(findTimer); findTimer = setTimeout(() => runFind(true), 120); });
+$('#find-q').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && e.altKey) { e.preventDefault(); return repoSearch(e.target.value); }
+  if (e.key === 'Enter') { e.preventDefault(); return stepFind(e.shiftKey ? -1 : 1); }
+  if (e.key === 'Escape') {
+    e.stopPropagation();
+    if (e.target.value) { e.target.value = ''; runFind(false); } else e.target.blur();
+  }
+});
+$('#find-prev').onclick = () => stepFind(-1);
+$('#find-next').onclick = () => stepFind(1);
+$('#find-repo').onclick = () => repoSearch($('#find-q').value);
+
+/** Ctrl/⌘+F: focus the find box, seeded with a one-line selection. */
+function focusFind() {
+  const box = $('#find-q');
+  const sel = String(window.getSelection() || '');
+  if (sel && !sel.includes('\n') && sel.length <= 200) { box.value = sel; runFind(false); }
+  box.focus();
+  box.select();
 }
 
 // ---------- inline code threads ----------
@@ -1567,13 +1987,14 @@ function threadEl(t) {
   return el;
 }
 
-/** Place a thread in the open file: under its last line, or at the top for the whole file. */
+/** Place a thread in its file's tab: under its last line, or at the top for the whole file. */
 function mountThread(t) {
-  if (viewer.path !== t.path || t.hidden) return;
-  let el = $(`#src-body .inline-thread[data-thread="${t.id}"]`);
+  const tab = viewer.tabs.find((x) => x.path === t.path);
+  if (!tab?.lines.length || t.hidden) return;
+  let el = tab.el.querySelector(`.inline-thread[data-thread="${t.id}"]`);
   if (!el) {
     el = threadEl(t);
-    const anchor = t.end ? document.getElementById(`L${t.end}`) : $('#src-body .src-hint');
+    const anchor = t.end ? lineEl(tab, t.end) : tab.el.querySelector('.src-hint');
     anchor?.after(el);
   }
   renderThread(t);
@@ -1599,6 +2020,7 @@ function openThread(path, start, end) {
   }
   t.hidden = false;
   const el = mountThread(t);
+  renderTabs();
   el?.scrollIntoView({ block: 'nearest' });
   $('textarea', el)?.focus();
 }
@@ -1665,6 +2087,7 @@ $('#src-body').addEventListener('click', (e) => {
     convById(el.dataset.thread).hidden = true;
     el.remove();
     if (state.tab === 'ask') renderChat();
+    renderTabs();
     return;
   }
   conversationClick(e);
@@ -1844,6 +2267,10 @@ $('#chat').addEventListener('click', (e) => {
 
 window.addEventListener('keydown', (e) => {
   const modalOpen = !$('#modal').hidden;
+  if (modalOpen && (e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'f') {
+    e.preventDefault();
+    return focusFind();
+  }
   if (e.key === 'Escape') {
     if (modalOpen && !$('#sym').hidden) { $('#sym').hidden = true; return; }
     if (modalOpen) return closeSource();

@@ -139,6 +139,7 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> std::io::Resu
         .route("/api/lsp/status", get(lsp_status))
         .route("/api/lsp/symbol", post(lsp_symbol))
         .route("/api/lsp/references", post(lsp_references))
+        .route("/api/lsp/outline", get(lsp_outline))
         .with_state(state);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -415,7 +416,10 @@ struct SourceQuery {
 
 #[derive(Deserialize)]
 struct SearchQuery {
-    word: String,
+    q: String,
+    /// Whole identifiers only (case-sensitive) instead of smart-case substrings.
+    #[serde(default)]
+    word: bool,
     #[serde(default = "default_search_limit")]
     limit: usize,
 }
@@ -425,13 +429,17 @@ fn default_search_limit() -> usize {
 }
 
 async fn text_search(State(st): State<Arc<AppState>>, Query(q): Query<SearchQuery>) -> ApiResult {
-    let word = q.word.trim().to_owned();
-    if word.is_empty() || word.len() > 200 || word.contains(char::is_whitespace) {
+    let text = if q.word { q.q.trim() } else { q.q.as_str() }.to_owned();
+    if text.trim().is_empty() || text.len() > 200 {
+        return Err(fail(StatusCode::BAD_REQUEST, "search for 1 to 200 characters"));
+    }
+    if q.word && text.contains(char::is_whitespace) {
         return Err(fail(StatusCode::BAD_REQUEST, "search for a single word"));
     }
+    let query = if q.word { search::Query::Word(text) } else { search::Query::Text(text) };
     let root = st.repo.root.clone();
     let limit = q.limit.clamp(1, 1000);
-    let results = tokio::task::spawn_blocking(move || search::search(&root, &word, limit))
+    let results = tokio::task::spawn_blocking(move || search::search(&root, &query, limit))
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!(results)))
@@ -474,6 +482,13 @@ async fn lsp_references(State(st): State<Arc<AppState>>, Json(req): Json<Positio
     let (full, shown) = verify::resolve(&st.repo.root, &req.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
     let refs = st.lsp.references(&full, &shown, req.line, req.character).await;
     refs.map(|r| Json(json!({ "references": r }))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
+}
+
+/// Functions, classes and other declarations in a file, from its language server.
+async fn lsp_outline(State(st): State<Arc<AppState>>, Query(q): Query<SourceQuery>) -> ApiResult {
+    let (full, shown) = verify::resolve(&st.repo.root, &q.path).map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    let items = st.lsp.outline(&full, &shown).await;
+    items.map(|i| Json(json!({ "symbols": i }))).map_err(|e| fail(StatusCode::BAD_GATEWAY, e))
 }
 
 /// L3: file contents or a directory listing, confined to the repository.

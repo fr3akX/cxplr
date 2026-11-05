@@ -244,6 +244,63 @@ async fn read_loop(
     }
 }
 
+#[derive(Serialize)]
+pub struct OutlineItem {
+    pub name: String,
+    /// Signature or type, when the server gives one.
+    pub detail: Option<String>,
+    /// LSP symbol kind, lowercased (`function`, `class`, `struct`, …).
+    pub kind: &'static str,
+    /// 1-based line of the symbol's name.
+    pub line: u64,
+    pub depth: usize,
+}
+
+fn symbol_kind(kind: u64) -> &'static str {
+    const KINDS: [&str; 26] = [
+        "file", "module", "namespace", "package", "class", "method", "property", "field", "constructor", "enum",
+        "interface", "function", "variable", "constant", "string", "number", "boolean", "array", "object", "key",
+        "null", "enum member", "struct", "event", "operator", "type parameter",
+    ];
+    kind.checked_sub(1).and_then(|i| KINDS.get(i as usize)).copied().unwrap_or("symbol")
+}
+
+/// Declarations worth navigating to: types, functions and namespaces at any depth
+/// (Rust `impl` blocks arrive as `object`), variables and constants only at the top
+/// level. Locals, fields and members of dropped symbols are left out.
+fn outline_items(symbols: &[Value], depth: usize, out: &mut Vec<OutlineItem>) {
+    let line_of = |s: &Value| {
+        let range = s.get("selectionRange").or_else(|| s.get("range")).or_else(|| s["location"].get("range"));
+        range.and_then(|r| r["start"]["line"].as_u64()).unwrap_or(0) + 1
+    };
+    let mut sorted: Vec<&Value> = symbols.iter().collect();
+    sorted.sort_by_key(|s| line_of(s));
+    for s in sorted {
+        let kind = symbol_kind(s["kind"].as_u64().unwrap_or(0));
+        // Flat results only say which symbol contains them.
+        let depth = if s.get("location").is_some() && s["containerName"].as_str().is_some_and(|c| !c.is_empty()) { 1 } else { depth };
+        let structural = matches!(
+            kind,
+            "module" | "namespace" | "package" | "class" | "method" | "constructor" | "enum" | "interface" | "function" | "object" | "struct"
+        );
+        let top_level_value = depth == 0 && matches!(kind, "variable" | "constant");
+        if !structural && !top_level_value {
+            continue;
+        }
+        let Some(name) = s["name"].as_str() else { continue };
+        out.push(OutlineItem {
+            name: name.to_owned(),
+            detail: s["detail"].as_str().filter(|d| !d.is_empty()).map(str::to_owned),
+            kind,
+            line: line_of(s),
+            depth,
+        });
+        if let Some(children) = s["children"].as_array() {
+            outline_items(children, depth + 1, out);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Location {
     /// Repository-relative path, or `None` when the target is outside the repository.
@@ -404,7 +461,8 @@ impl Lsp {
                     "synchronization": { "didSave": false },
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "definition": { "linkSupport": true },
-                    "references": {}
+                    "references": {},
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true }
                 },
                 "window": { "workDoneProgress": true },
                 "workspace": { "configuration": true, "workspaceFolders": true }
@@ -460,6 +518,16 @@ impl Lsp {
         let mut refs = self.locations(&result);
         refs.truncate(MAX_REFERENCES);
         Ok(refs)
+    }
+
+    /// The file's declarations, in source order, nested by depth.
+    pub async fn outline(&self, full: &Path, rel: &str) -> Result<Vec<OutlineItem>, String> {
+        let (server, uri) = self.open(full, rel).await?;
+        let params = json!({ "textDocument": { "uri": uri } });
+        let result = server.request("textDocument/documentSymbol", params, REQUEST_TIMEOUT).await?;
+        let mut out = Vec::new();
+        outline_items(result.as_array().map_or(&[][..], Vec::as_slice), 0, &mut out);
+        Ok(out)
     }
 
     /// Accepts `Location`, `Location[]` and `LocationLink[]` results.

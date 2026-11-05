@@ -158,14 +158,27 @@ Simulation shows paths and data, not timing or throughput.
 Opens from any citation or path. Syntax highlighting is bundled (highlight.js, no
 network access); directories can be browsed from the breadcrumb.
 
+- **Tabs:** each file opens in its own tab, and a tab keeps its scroll position and
+  inline threads while you look elsewhere. Following a citation out of a thread opens
+  the cited file next to it; the thread's tab is still where you left it (● marks tabs
+  with threads). Close a tab with ✕ or a middle-click. Closing the viewer keeps the
+  tabs; the least recently used is closed beyond 20.
+- **‹ / ›** or Alt+←/→ walk the navigation history across tabs, back to the exact
+  scroll position. `Esc` closes the side pane, then the viewer.
+- **Outline** (left pane, toggled from the header): the file's functions, classes,
+  methods and other declarations, nested, with a filter; click one to jump to it, and the
+  one you are reading is highlighted. It comes from the language server when one is
+  running; until then, and for other files, name patterns cover Rust, Python, JS/TS, Go,
+  Java/Kotlin/C#/Swift, C/C++, Ruby, PHP, shell and Markdown headings. The footer says
+  which.
+- **Find:** Ctrl/⌘+F searches the open file and highlights every match (Enter / Shift+Enter
+  step through them); **In repo** (or Alt+Enter) lists matches across the repository,
+  respecting `.gitignore`. Both ignore case unless the query has a capital letter.
 - Click a name: the side pane shows its signature/docs, its definitions and, on
   request, references. Ctrl/⌘-click jumps straight to a single definition.
-- **‹ / ›** or Alt+←/→ walk the navigation history. `Esc` closes the pane, then the
-  viewer.
 - The header chip shows the language server state (`starting…`, `indexing…`, ready,
   `unavailable`). Files without a server (YAML, shell, configs, …) or with a failed
-  server fall back to whole-word text search across the repository, respecting
-  `.gitignore`.
+  server fall back to whole-word text search across the repository.
 
 Language servers are found on `PATH` and started on first use, one per language, with
 the repository as workspace:

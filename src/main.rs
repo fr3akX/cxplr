@@ -136,6 +136,33 @@ async fn rebuild_atlas(ex: &Arc<explore::Explorer>) {
     }
 }
 
+/// Raise the soft open-file limit to the hard limit. `codex app-server` keeps every
+/// session it has loaded open until it exits, and a large index loads dozens, which
+/// runs out of descriptors under macOS's default soft limit of 256. The app-server
+/// and language servers inherit the raised limit.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed in.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    // macOS rejects soft limits above OPEN_MAX, even when the hard limit is unlimited.
+    #[cfg(target_os = "macos")]
+    let want = lim.rlim_max.min(10240);
+    #[cfg(not(target_os = "macos"))]
+    let want = lim.rlim_max;
+    if want > lim.rlim_cur {
+        let raised = libc::rlimit { rlim_cur: want, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            lim.rlim_cur = want;
+        }
+    }
+    if lim.rlim_cur < 1024 {
+        println!("warning: open-file limit is {}; large indexes may fail (raise it with `ulimit -n`)", lim.rlim_cur);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -160,6 +187,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    #[cfg(unix)]
+    raise_open_file_limit();
     let repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
     let cache = cache::Cache::open(cache_dir.clone(), args.model.as_deref())

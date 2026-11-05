@@ -260,6 +260,56 @@ details summary { cursor: pointer; color: var(--muted); }
 .src-line .code { flex: 1; padding-right: 16px; cursor: text; }
 .src-line.target { background: var(--hl); }
 .src-line.sym-line { background: var(--accent-soft); }
+.src-line.find-line { box-shadow: inset 3px 0 0 var(--warn); }
+::highlight(find) { background-color: rgba(255, 200, 0, .35); }
+::highlight(find-current) { background-color: rgba(255, 140, 0, .75); color: #000; }
+.src-pane[hidden] { display: none; }
+
+#src-tabs {
+  display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); overflow-x: auto;
+  background: var(--bg); min-height: 34px; scrollbar-width: thin;
+}
+#src-tabs:empty { display: none; }
+.src-tab {
+  display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; border: 1px solid var(--border);
+  border-bottom: none; border-radius: 6px 6px 0 0; font-family: ui-monospace, Menlo, monospace; font-size: 12px;
+  color: var(--muted); cursor: pointer; white-space: nowrap; background: var(--bg); max-width: 240px;
+}
+.src-tab .name { overflow: hidden; text-overflow: ellipsis; }
+.src-tab.active { background: var(--surface); color: var(--fg); position: relative; top: 1px; }
+.src-tab:hover { color: var(--fg); }
+.src-tab .tab-dot { color: var(--accent); font-size: 9px; }
+.src-tab button { border: none; background: none; padding: 0 3px; font-size: 11px; color: var(--muted); line-height: 1; }
+.src-tab button:hover { color: var(--err); }
+
+#src-outline-btn.active { border-color: var(--accent); color: var(--accent); }
+.modal-head .find { display: flex; align-items: center; gap: 4px; font-family: system-ui, sans-serif; }
+#find-q { width: 170px; font: 12.5px ui-monospace, Menlo, monospace; padding: 3px 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--fg); }
+#find-q:focus { outline: none; border-color: var(--accent); }
+#find-q.none { border-color: var(--err); }
+#find-count { font-size: 11.5px; color: var(--muted); min-width: 48px; text-align: right; white-space: nowrap; }
+.modal-head .find button { padding: 2px 7px; }
+
+#outline {
+  width: 250px; flex: none; border-right: 1px solid var(--border); display: flex; flex-direction: column;
+  min-height: 0; font-size: 12.5px; background: var(--surface);
+}
+#outline[hidden] { display: none; }
+#ol-filter { margin: 8px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--fg); font-size: 12.5px; }
+#ol-filter:focus { outline: none; border-color: var(--accent); }
+#ol-list { list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; flex: 1; }
+#ol-list li { display: flex; align-items: center; gap: 6px; padding: 2px 8px; cursor: pointer; white-space: nowrap; }
+#ol-list li:hover { background: var(--accent-soft); }
+#ol-list li.current { background: var(--hl); }
+.ol-name { overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, Menlo, monospace; }
+.ol-badge { flex: none; width: 16px; text-align: center; font: 600 11px ui-monospace, Menlo, monospace; border-radius: 3px; }
+.ol-fn { color: var(--k-function); }
+.ol-ty { color: var(--k-class); }
+.ol-mod { color: var(--k-module); }
+.ol-val { color: var(--muted); }
+.ol-doc { color: var(--accent); }
+#ol-foot { padding: 6px 10px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--muted); }
+#ol-foot:empty { display: none; }
 .src-hint { padding: 6px 16px; font-family: system-ui, sans-serif; font-size: 12px; color: var(--muted); border-bottom: 1px dashed var(--border); }
 .dir-list { list-style: none; margin: 0; padding: 10px 16px; }
 .dir-list li { padding: 3px 0; }

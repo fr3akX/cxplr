@@ -1,5 +1,6 @@
-//! Whole-word text search across the repository: the navigation fallback for
-//! files without a language server (YAML, shell, configs, …).
+//! Text search across the repository: whole-word matches are the navigation
+//! fallback for files without a language server (YAML, shell, configs, …);
+//! substring matches back the viewer's search box.
 
 use serde::Serialize;
 use std::fs;
@@ -35,9 +36,36 @@ fn contains_word(line: &str, word: &str) -> bool {
     })
 }
 
+pub enum Query {
+    /// A whole identifier, case-sensitive.
+    Word(String),
+    /// A substring; case-insensitive unless it contains an uppercase letter (smart case).
+    Text(String),
+}
+
+impl Query {
+    fn ignore_case(&self) -> bool {
+        matches!(self, Query::Text(q) if !q.chars().any(char::is_uppercase))
+    }
+
+    /// `needle` is already lowercased when the search ignores case.
+    fn matches(&self, line: &str, needle: &str) -> bool {
+        match self {
+            Query::Word(_) => contains_word(line, needle),
+            Query::Text(_) if self.ignore_case() => line.to_lowercase().contains(needle),
+            Query::Text(_) => line.contains(needle),
+        }
+    }
+}
+
 /// Search tracked-looking files (respecting .gitignore, skipping `.git`,
 /// binaries and files over 1 MiB), stopping after `limit` hits.
-pub fn search(root: &Path, word: &str, limit: usize) -> Results {
+pub fn search(root: &Path, query: &Query, limit: usize) -> Results {
+    let needle = match query {
+        Query::Word(w) => w.clone(),
+        Query::Text(q) if query.ignore_case() => q.to_lowercase(),
+        Query::Text(q) => q.clone(),
+    };
     let mut hits = Vec::new();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -55,12 +83,13 @@ pub fn search(root: &Path, word: &str, limit: usize) -> Results {
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
-        if !text.contains(word) {
+        let candidate = if query.ignore_case() { text.to_lowercase().contains(&needle) } else { text.contains(&needle) };
+        if !candidate {
             continue;
         }
         let rel = entry.path().strip_prefix(root).unwrap_or(entry.path()).to_string_lossy().into_owned();
         for (i, line) in text.lines().enumerate() {
-            if contains_word(line, word) {
+            if query.matches(line, &needle) {
                 if hits.len() == limit {
                     return Results { hits, truncated: true };
                 }
@@ -74,7 +103,7 @@ pub fn search(root: &Path, word: &str, limit: usize) -> Results {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_word;
+    use super::{contains_word, Query};
 
     #[test]
     fn matches_whole_identifiers_only() {
@@ -83,5 +112,15 @@ mod tests {
         assert!(!contains_word("let users = user_id;", "user"));
         assert!(!contains_word("$user", "user"));
         assert!(contains_word("user", "user"));
+    }
+
+    #[test]
+    fn text_queries_use_smart_case() {
+        let lower = Query::Text("user".into());
+        assert!(lower.matches("let User = 1;", "user"));
+        assert!(lower.matches("load_users()", "user"));
+        let upper = Query::Text("User".into());
+        assert!(upper.matches("struct User;", "User"));
+        assert!(!upper.matches("let user = 1;", "User"));
     }
 }
