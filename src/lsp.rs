@@ -17,6 +17,8 @@ use tokio::sync::oneshot;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+/// Importing a build downloads the build tool and dependencies on first run.
+const BUILD_IMPORT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_REFERENCES: usize = 500;
 
 /// Language → candidate server commands; the first one found on PATH is used.
@@ -26,9 +28,10 @@ const DEFAULT_SERVERS: &[(&str, &[&str])] = &[
     ("typescript", &["typescript-language-server --stdio"]),
     ("go", &["gopls"]),
     ("c", &["clangd"]),
+    ("scala", &["metals"]),
 ];
 
-pub const LANGUAGES: &[&str] = &["rust", "python", "typescript", "go", "c"];
+pub const LANGUAGES: &[&str] = &["rust", "python", "typescript", "go", "c", "scala"];
 
 /// Server language for a file, plus the document's LSP `languageId`.
 pub fn language_of(path: &str) -> Option<(&'static str, &'static str)> {
@@ -43,6 +46,7 @@ pub fn language_of(path: &str) -> Option<(&'static str, &'static str)> {
         "go" => ("go", "go"),
         "c" | "h" => ("c", "c"),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => ("c", "cpp"),
+        "scala" | "sc" | "sbt" => ("scala", "scala"),
         _ => return None,
     })
 }
@@ -58,6 +62,22 @@ fn initialization_options(lang: &str) -> Value {
         }),
         _ => Value::Null,
     }
+}
+
+/// Answer to `window/showMessageRequest`. Metals asks before importing a build, which
+/// runs sbt, Mill, Gradle, … on the repository: dismiss unless the user opted in, then
+/// pick "Import build" (or the build tool, when Metals asks which one to use).
+fn message_choice(params: &Value, import_builds: bool) -> Value {
+    if !import_builds {
+        return Value::Null;
+    }
+    let about_builds = params["message"].as_str().is_some_and(|m| m.to_lowercase().contains("build"));
+    let tools = ["sbt", "mill", "gradle", "maven", "scala-cli", "bloop", "bazel"];
+    let chosen = params["actions"].as_array().into_iter().flatten().find(|a| {
+        let title = a["title"].as_str().unwrap_or("").to_lowercase();
+        title.starts_with("import") || (about_builds && tools.contains(&title.as_str()))
+    });
+    chosen.cloned().unwrap_or(Value::Null)
 }
 
 fn on_path(program: &str) -> bool {
@@ -159,6 +179,24 @@ impl Server {
     }
 }
 
+/// How cxplr answers the requests servers send it and wait on.
+#[derive(Clone)]
+struct Client {
+    root_uri: String,
+    import_builds: bool,
+}
+
+impl Client {
+    fn answer(&self, method: &str, params: &Value) -> Value {
+        match method {
+            "workspace/configuration" => json!(vec![Value::Null; params["items"].as_array().map_or(0, Vec::len)]),
+            "workspace/workspaceFolders" => json!([{ "uri": self.root_uri, "name": "workspace" }]),
+            "window/showMessageRequest" => message_choice(params, self.import_builds),
+            _ => Value::Null,
+        }
+    }
+}
+
 /// Completes pending requests, answers the server-to-client requests servers
 /// wait on, and tracks progress. Ends when the server's stdout closes.
 async fn read_loop(
@@ -168,7 +206,7 @@ async fn read_loop(
     progress: Shared<HashSet<String>>,
     exited: Shared<Option<String>>,
     stderr_tail: Shared<String>,
-    root_uri: String,
+    client: Client,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut header = String::new();
@@ -206,13 +244,7 @@ async fn read_loop(
                 }
             }
             (Some(method), Some(id)) => {
-                let result = match method {
-                    "workspace/configuration" => {
-                        json!(vec![Value::Null; msg["params"]["items"].as_array().map_or(0, Vec::len)])
-                    }
-                    "workspace/workspaceFolders" => json!([{ "uri": root_uri, "name": "workspace" }]),
-                    _ => Value::Null,
-                };
+                let result = client.answer(method, &msg["params"]);
                 let _ = write_message(&stdin, &json!({ "jsonrpc": "2.0", "id": id, "result": result })).await;
             }
             (Some("$/progress"), None) => {
@@ -335,14 +367,15 @@ type Slot = Arc<tokio::sync::OnceCell<Result<Arc<Server>, String>>>;
 
 pub struct Lsp {
     root: PathBuf,
-    root_uri: String,
+    client: Client,
     commands: HashMap<String, String>,
     slots: Mutex<HashMap<&'static str, Slot>>,
 }
 
 impl Lsp {
     /// `overrides` are `language=command` pairs; an empty command disables that language.
-    pub fn new(root: &Path, enabled: bool, overrides: &[(String, String)]) -> Lsp {
+    /// `import_builds` lets servers import the project build (Metals), which runs the build tool.
+    pub fn new(root: &Path, enabled: bool, overrides: &[(String, String)], import_builds: bool) -> Lsp {
         let mut commands = HashMap::new();
         if enabled {
             for (lang, candidates) in DEFAULT_SERVERS {
@@ -358,7 +391,8 @@ impl Lsp {
                 }
             }
         }
-        Lsp { root: root.to_owned(), root_uri: path_to_uri(root), commands, slots: Default::default() }
+        let client = Client { root_uri: path_to_uri(root), import_builds };
+        Lsp { root: root.to_owned(), client, commands, slots: Default::default() }
     }
 
     /// Configured (language, command) pairs, for the startup banner.
@@ -445,13 +479,13 @@ impl Lsp {
             server.progress.clone(),
             server.exited.clone(),
             stderr_tail,
-            self.root_uri.clone(),
+            self.client.clone(),
         ));
 
-        let folder = json!([{ "uri": self.root_uri, "name": "workspace" }]);
+        let folder = json!([{ "uri": self.client.root_uri, "name": "workspace" }]);
         let params = json!({
             "processId": std::process::id(),
-            "rootUri": self.root_uri,
+            "rootUri": self.client.root_uri,
             "rootPath": self.root,
             "workspaceFolders": folder,
             "initializationOptions": initialization_options(lang),
@@ -468,12 +502,30 @@ impl Lsp {
                 "workspace": { "configuration": true, "workspaceFolders": true }
             }
         });
-        server
+        let init = server
             .request("initialize", params, INIT_TIMEOUT)
             .await
             .map_err(|e| format!("`{cmd}` failed to initialize: {e}"))?;
         server.notify("initialized", json!({})).await?;
+        self.import_build(&server, &init);
         Ok(server)
+    }
+
+    /// With `--lsp-import-build`, ask a server that offers `build-import` (Metals) to
+    /// import the project build, unless one was imported before (`.bloop/`): Metals
+    /// reconnects to that by itself. The prompt is not relied on, since Metals stops
+    /// asking once an earlier read-only run dismissed it.
+    fn import_build(&self, server: &Arc<Server>, init: &Value) {
+        let commands = init["capabilities"]["executeCommandProvider"]["commands"].as_array();
+        let offered = commands.is_some_and(|c| c.iter().any(|c| c == "build-import"));
+        if !self.client.import_builds || !offered || self.root.join(".bloop").exists() {
+            return;
+        }
+        let server = server.clone();
+        tokio::spawn(async move {
+            let params = json!({ "command": "build-import", "arguments": [] });
+            let _ = server.request("workspace/executeCommand", params, BUILD_IMPORT_TIMEOUT).await;
+        });
     }
 
     async fn open(&self, full: &Path, rel: &str) -> Result<(Arc<Server>, String), String> {
@@ -608,5 +660,18 @@ mod tests {
         assert_eq!(uri, "file:///tmp/a%20dir/%C3%BC%23%3F.py");
         assert_eq!(uri_to_path(&uri).unwrap(), path);
         assert_eq!(uri_to_path("file:///x/100%").unwrap(), Path::new("/x/100%"));
+    }
+
+    #[test]
+    fn build_imports_need_the_opt_in() {
+        let import = json!({ "message": "New sbt workspace detected, would you like to import the build?",
+            "actions": [{ "title": "Import build" }, { "title": "Not now" }, { "title": "Don't show again" }] });
+        assert_eq!(message_choice(&import, false), Value::Null);
+        assert_eq!(message_choice(&import, true), json!({ "title": "Import build" }));
+        let tool = json!({ "message": "Multiple build definitions found. Which would you like to use?",
+            "actions": [{ "title": "mill" }, { "title": "sbt" }] });
+        assert_eq!(message_choice(&tool, true), json!({ "title": "mill" }));
+        let other = json!({ "message": "Upgrade to Scala 3?", "actions": [{ "title": "Yes" }] });
+        assert_eq!(message_choice(&other, true), Value::Null);
     }
 }

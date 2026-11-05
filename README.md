@@ -10,8 +10,9 @@ cited source lines, in a local web UI.
   content-addressed cache that survives commits.
 - **Simulation**: watch N inputs travel a data flow; generate concrete example inputs
   that take different branches, with the data at every step.
-- **Source viewer** with syntax highlighting and code navigation through language
-  servers (definitions, references, docs), with text-search fallback.
+- **Source viewer** with tabs that keep their place, a functions/classes outline, find
+  in file and across the repository, syntax highlighting and code navigation through
+  language servers (Rust, Python, TS/JS, Go, C/C++, Scala), with text-search fallback.
 - **Ask questions** inline under selected code or about the current map; follow-ups
   continue the same Codex session.
 - **Atlas**: every map as Markdown in `.cxplr/atlas/`, plus a Codex skill so your other
@@ -48,7 +49,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.3.0 is available (you have 0.2.0): run `cxplr --update`
+cxplr 0.5.0 is available (you have 0.4.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; an installed Codex
@@ -63,8 +64,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.3.0"
-git tag v0.3.0 && git push && git push --tags
+cargo build && git commit -am "Release 0.5.0"
+git tag v0.5.0 && git push && git push --tags
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -190,6 +191,7 @@ the repository as workspace:
 | TypeScript / JavaScript | `typescript-language-server --stdio` |
 | Go | `gopls` |
 | C / C++ | `clangd` |
+| Scala (`.scala`, `.sc`, `.sbt`) | `metals` (build import off; see [Scala](#scala)) |
 
 Override or add one with `--lsp LANG=COMMAND` (repeatable); `--lsp python=` disables a
 language and `--no-lsp` disables all. For example, pyright without a global install:
@@ -199,7 +201,8 @@ cxplr /path/to/repo --lsp "python=npx -y -p pyright@1 pyright-langserver --stdio
 ```
 
 Language servers can run project tooling (`gopls` runs `go list`, TypeScript loads
-tsconfig plugins); use `--no-lsp` for repositories you do not trust.
+tsconfig plugins, Metals with `--lsp-import-build` runs the build); use `--no-lsp` for
+repositories you do not trust.
 
 ### Rust
 
@@ -223,6 +226,28 @@ toolchain:
 cxplr /path/to/repo --lsp "rust=$HOME/.local/bin/rust-analyzer"
 cxplr /path/to/repo --lsp "rust=rustup run nightly rust-analyzer"
 ```
+
+### Scala
+
+Install Metals with [coursier](https://get-coursier.io) (needs a JDK):
+
+```sh
+cs install metals
+```
+
+By default cxplr declines Metals' build import, so nothing in the project runs: the
+outline, highlighting and hover within a file work, while definitions and references
+across files fall back to text search. `--lsp-import-build` imports the build (sbt,
+Mill, Gradle, … through Bloop, with Metals' bundled sbt launcher if sbt is not
+installed). That runs the build definition, downloads dependencies and compiles, which
+can take minutes the first time; afterwards definitions and references work across the
+project. Once imported (`.bloop/` exists), Metals reconnects to that build on later
+starts even without the flag; delete `.bloop/` and `.bsp/` to go back.
+
+Metals keeps its state in `.metals/` (and the import adds `.bloop/`, `.bsp/` and the
+build's `target/` directories). cxplr leaves `.metals/`, `.bloop/`, `.bsp/` and
+`.scala-build/` out of maps, search and listings, so a running language server never
+makes maps stale; `target/` is normally gitignored and is then excluded as well.
 
 ## Asking questions
 
@@ -348,8 +373,9 @@ cxplr [REPO] [OPTIONS]
 | `--codex PATH` | `codex` | Codex executable (run as `codex app-server`) |
 | `--timeout-mins N` | 20 | Limit for one exploration, question or example run |
 | `--cache-dir DIR` | `REPO/.cxplr` | Cache location |
-| `--lsp LANG=COMMAND` | auto | Language server per language (`rust`, `python`, `typescript`, `go`, `c`); empty command disables |
+| `--lsp LANG=COMMAND` | auto | Language server per language (`rust`, `python`, `typescript`, `go`, `c`, `scala`); empty command disables |
 | `--no-lsp` | | Disable language servers; navigation uses text search |
+| `--lsp-import-build` | | Let Metals import the Scala build for full navigation (runs the build tool) |
 | `--forget-sessions` | | Delete the Codex sessions cxplr created for `REPO` and exit |
 | `--install-skill` | | Install the cxplr skill for Codex and exit |
 | `--update` | | Install the latest release now (installer installs) and exit |

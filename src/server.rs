@@ -500,8 +500,8 @@ async fn source(State(st): State<Arc<AppState>>, Query(q): Query<SourceQuery>) -
         let mut entries: Vec<(bool, String)> = fs::read_dir(&full)
             .map_err(io)?
             .filter_map(Result::ok)
+            .filter(|e| !crate::repo::is_tool_dir(&e.file_name()))
             .map(|e| (e.path().is_dir(), e.file_name().to_string_lossy().into_owned()))
-            .filter(|(_, name)| name != ".git" && name != crate::repo::CACHE_DIR_NAME)
             .collect();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let entries: Vec<Value> = entries.into_iter().map(|(dir, name)| json!({ "name": name, "dir": dir })).collect();

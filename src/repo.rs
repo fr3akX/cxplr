@@ -10,6 +10,17 @@ use std::process::Command;
 
 /// Project-local cache directory; never part of a map's content.
 pub const CACHE_DIR_NAME: &str = ".cxplr";
+
+/// Directories that hold tool state rather than project content: git, cxplr's cache,
+/// and what Metals, Bloop, sbt/BSP and Scala CLI create while a Scala language server
+/// runs. They are never part of a map's content, searches or directory listings, so a
+/// language server starting does not make maps stale.
+const TOOL_DIRS: &[&str] = &[".git", CACHE_DIR_NAME, ".metals", ".bloop", ".bsp", ".scala-build"];
+
+pub fn is_tool_dir(name: &std::ffi::OsStr) -> bool {
+    TOOL_DIRS.iter().any(|d| name == *d)
+}
+
 const MAX_CHANGED: usize = 50;
 
 /// Repository-relative file path → git blob hash of its current working-tree content.
@@ -101,7 +112,7 @@ impl Repo {
                 Err(_) => manifest.remove(&path), // deleted in the working tree
             };
         }
-        manifest.retain(|p, _| !p.starts_with(CACHE_DIR_NAME));
+        manifest.retain(|p, _| !p.split('/').any(|part| TOOL_DIRS.contains(&part)));
         manifest
     }
 
@@ -132,11 +143,11 @@ impl Repo {
     }
 
     /// Files under a repository-relative path, respecting ignore files and skipping
-    /// `.git`, the cache directory and files over 1 MiB.
+    /// tool directories and files over 1 MiB.
     fn walk(&self, path: &str) -> impl Iterator<Item = ignore::DirEntry> {
         ignore::WalkBuilder::new(self.root.join(path))
             .hidden(false)
-            .filter_entry(|e| e.file_name() != ".git" && e.file_name() != CACHE_DIR_NAME)
+            .filter_entry(|e| !is_tool_dir(e.file_name()))
             .build()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
@@ -240,13 +251,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_directory_is_never_part_of_the_content() {
+    fn tool_directories_are_never_part_of_the_content() {
         let dir = TempGit::new("cachedir");
         let repo = Repo::open(&dir.0).unwrap();
         let all = vec![".".to_owned()];
         let before = repo.manifest(&all);
-        fs::create_dir_all(dir.0.join(CACHE_DIR_NAME)).unwrap();
-        fs::write(dir.0.join(CACHE_DIR_NAME).join("map.json"), "{}").unwrap();
+        for (d, file) in [(CACHE_DIR_NAME, "map.json"), (".metals", "metals.log"), ("sub/.bloop", "sub.json")] {
+            fs::create_dir_all(dir.0.join(d)).unwrap();
+            fs::write(dir.0.join(d).join(file), "{}").unwrap();
+        }
         assert_eq!(repo.manifest(&all), before);
     }
 }

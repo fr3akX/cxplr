@@ -1185,7 +1185,7 @@ const HL_BY_EXT = {
   psm1: 'powershell', psd1: 'powershell', psrc: 'powershell', yaml: 'yaml', yml: 'yaml', json: 'json', jsonl: 'json',
   toml: 'ini', ini: 'ini', cfg: 'ini', service: 'ini', timer: 'ini', socket: 'ini', path: 'ini', md: 'markdown',
   markdown: 'markdown', html: 'xml', htm: 'xml', xml: 'xml', svg: 'xml', css: 'css', scss: 'scss', less: 'less',
-  sql: 'sql', graphql: 'graphql', diff: 'diff', patch: 'diff', mk: 'makefile',
+  sql: 'sql', graphql: 'graphql', diff: 'diff', patch: 'diff', mk: 'makefile', scala: 'scala', sc: 'scala', sbt: 'scala',
 };
 const MAX_HIGHLIGHT_CHARS = 600000;
 
@@ -1713,6 +1713,13 @@ const OUTLINE_RULES = {
     [new RegExp(`^\\s*${MODIFIERS}(?:fun|func|def)\\s+(?:<[^>]*>\\s*)?(?:[\\w.]+\\.)?(?<name>\\w+)`), 'function'],
     [/^\s+(?:(?:public|private|protected|internal|static|final|abstract|synchronized|override|virtual|async|native|default)\s+)+[\w<>[\],.?\s]+?\s+(?<name>\w+)\s*\([^;]*$/, 'method'],
   ],
+  scala: [
+    [/^\s*(?:(?:private|protected)(?:\[[\w.]*\])?\s+|(?:final|sealed|abstract|implicit|case|lazy|override|inline|transparent|open|opaque)\s+)*(?<kind>class|trait|object|enum)\s+(?<name>\w+)/],
+    [/^\s*(?:(?:private|protected)(?:\[[\w.]*\])?\s+|(?:final|implicit|override|inline|transparent|opaque)\s+)*(?<kind>type|given)\s+(?<name>\w+)/],
+    [/^\s*(?:(?:private|protected)(?:\[[\w.]*\])?\s+|(?:final|implicit|override|inline|transparent|abstract)\s+)*def\s+(?<name>[\w$]+|`[^`]+`|[^\s\w(\[:]+)/, 'method'],
+    [/^\s*extension\s*(?:\[[^\]]*\])?\s*\((?<name>[^)]*)\)/, 'extension'],
+    [/^package\s+(?<name>[\w.]+)/, 'package'],
+  ],
   c: [
     [/^\s*(?:typedef\s+)?(?<kind>struct|class|enum|union|namespace)\s+(?<name>\w+)\s*(?:[:{]|$)/],
     [/^[A-Za-z_][\w:<>,*&\s]*?[\s*&](?<name>[A-Za-z_][\w:~]*)\s*\([^;]*$/, 'function'],
@@ -1732,7 +1739,7 @@ const OUTLINE_RULES = {
 };
 const OUTLINE_LANG = {
   rs: 'rust', py: 'python', pyi: 'python', js: 'js', mjs: 'js', cjs: 'js', jsx: 'js', ts: 'js', tsx: 'js', mts: 'js', cts: 'js',
-  go: 'go', java: 'jvm', kt: 'jvm', kts: 'jvm', scala: 'jvm', cs: 'jvm', swift: 'jvm', dart: 'jvm',
+  go: 'go', java: 'jvm', kt: 'jvm', kts: 'jvm', scala: 'scala', sc: 'scala', sbt: 'scala', cs: 'jvm', swift: 'jvm', dart: 'jvm',
   c: 'c', h: 'c', cc: 'c', cpp: 'c', cxx: 'c', hpp: 'c', hh: 'c', rb: 'ruby', php: 'php',
   sh: 'shell', bash: 'shell', zsh: 'shell', md: 'markdown', markdown: 'markdown',
 };

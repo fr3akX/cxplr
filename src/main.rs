@@ -66,12 +66,16 @@ struct Args {
     #[arg(long)]
     open: bool,
     /// Language server for a language, e.g. `python=pyright-langserver --stdio`;
-    /// an empty command disables it. Languages: rust, python, typescript, go, c
+    /// an empty command disables it. Languages: rust, python, typescript, go, c, scala
     #[arg(long = "lsp", value_name = "LANG=COMMAND", value_parser = parse_lsp)]
     lsp: Vec<(String, String)>,
     /// Disable language servers; navigation falls back to text search
     #[arg(long)]
     no_lsp: bool,
+    /// Let language servers import the project build for full navigation (Metals:
+    /// runs the build tool, e.g. sbt, on the repository). Off: Scala stays read-only
+    #[arg(long)]
+    lsp_import_build: bool,
     /// Delete every Codex session cxplr created for this project and exit
     /// (cached maps are kept; later explorations start new sessions)
     #[arg(long)]
@@ -254,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Freshness depends on the working tree, so refresh the atlas on every start.
     rebuild_atlas(&ex).await;
 
-    let lsp = lsp::Lsp::new(&ex.repo.root, !args.no_lsp, &args.lsp);
+    let lsp = lsp::Lsp::new(&ex.repo.root, !args.no_lsp, &args.lsp, args.lsp_import_build);
     let servers = lsp.configured();
     if servers.is_empty() {
         println!("language servers: none (navigation uses text search)");
