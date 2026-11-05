@@ -17,10 +17,13 @@ cited source lines, in a local web UI.
   continue the same agent session.
 - **Atlas**: every map as Markdown in `.cxplr/atlas/`, plus a Codex / Claude Code skill
   so your other sessions can use it.
+- **Native Claude**: Anthropic Messages streaming with browser OAuth login or an API
+  key, repository-confined tools and persisted conversations—no agent CLI required.
 
-The exploration is done by [Codex](https://github.com/openai/codex) (default) or
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code), in read-only sessions
-that form a tree mirroring the map (see [Engines](#engines) and [Sessions](#sessions)).
+The exploration is done by [Codex](https://github.com/openai/codex) (default),
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code), or a native Anthropic
+Messages client, in read-only sessions that form a tree mirroring the map
+(see [Engines](#engines) and [Sessions](#sessions)).
 
 ## Requirements
 
@@ -28,22 +31,24 @@ that form a tree mirroring the map (see [Engines](#engines) and [Sessions](#sess
 - One engine, logged in:
   - `codex` on `PATH` with `codex app-server` (experimental in Codex 0.166), or
   - `claude` (Claude Code) on `PATH`, with `--restricted` (Claude Code 2.1.3xx;
-    `claude update` otherwise), for `--engine claude`.
+    `claude update` otherwise), for `--engine claude`, or
+  - an Anthropic API key or Claude subscription OAuth login for `--engine anthropic`;
+    neither agent CLI is needed (see [Native Anthropic](#native-anthropic)).
 
-  cxplr stops with a clear error if the engine is missing or too old. Model and
-  reasoning effort come from the engine's own config unless `--model` is given.
+  cxplr stops with a clear error if the selected CLI is missing or too old. CLI model
+  and reasoning settings come from that engine's config unless `--model` is given.
 - Optional: language servers for code navigation (see [Source viewer](#source-viewer)).
 
 ## Engines
 
-| | `--engine codex` (default) | `--engine claude` |
-| --- | --- | --- |
-| Runs | one long-lived `codex app-server` | `claude -p` per turn (headless Claude Code) |
-| Account | your Codex login | your Claude Code login (Claude subscription or API key) |
-| Tools | read-only shell commands (`rg`, `sed -n`, `nl -ba`, …) | `Read`, `Grep`, `Glob` only |
-| Isolation | `sandbox: read-only`, approvals off, hooks/plugins/apps/memories/browser disabled | `--restricted`: no command-running tools, no MCP servers, no settings files (so no hooks) from the user or the repository, file tools confined to the repository |
-| Sessions | Codex threads (`codex resume <id>`) | Claude Code sessions (`claude --resume <id>`) |
-| `--model` | Codex model | Claude model or alias (`sonnet`, `opus`, …) |
+| | `--engine codex` (default) | `--engine claude` | `--engine anthropic` |
+| --- | --- | --- | --- |
+| Runs | one long-lived `codex app-server` | `claude -p` per turn | native Rust agent and Anthropic Messages streaming |
+| Account | your Codex login | your Claude Code login | cxplr OAuth login, OAuth access token, or Anthropic API key |
+| Tools | read-only shell commands | `Read`, `Grep`, `Glob` | bounded file reads, regex search, globs and directory listings |
+| Isolation | read-only sandbox, approvals off, integrations disabled | restricted tools, no MCP servers or user/project settings | no shell, code execution, hooks, plugins or project configuration; tools confined to the repository |
+| Sessions | Codex threads (`codex resume <id>`) | Claude Code sessions (`claude --resume <id>`) | private JSON histories in the cache; resumed by cxplr |
+| `--model` | Codex model | Claude model or alias (`sonnet`, `opus`, …) | full Anthropic model id; default `claude-sonnet-5-5` |
 
 ```sh
 cxplr --engine claude --index      # map the project with Claude Code
@@ -53,6 +58,54 @@ cxplr --engine claude --model opus # browse and ask with Opus
 Each engine has its own cache keys and sessions: maps made with one show as stale under
 the other until refreshed, and sessions are never shared across engines. Maps made by
 Codex before this option existed keep their keys.
+
+### Native Anthropic
+
+Sign in with your Claude subscription through the browser, then index without an
+external agent process:
+
+```sh
+cxplr --anthropic-login
+cxplr --engine anthropic --index
+```
+
+Login uses Anthropic's authorization-code OAuth flow with PKCE. cxplr opens the
+authorization page and waits for the redirect to `http://localhost:54545/callback`
+(port 54545 must be free). For a remote/headless machine, paste the full redirect URL
+or `code#state` into the terminal instead; input is hidden and state is checked.
+Ctrl-C cancels. Access and refresh tokens are stored atomically in
+`$XDG_CONFIG_HOME/cxplr/anthropic.json` (default `~/.config/cxplr/anthropic.json`),
+with file mode 0600. Stored logins refresh automatically before expiry; refreshes
+are serialized across concurrent jobs and cxplr processes.
+
+Credential precedence is `ANTHROPIC_OAUTH_TOKEN`, then `ANTHROPIC_API_KEY`, then
+cxplr's saved login. Environment access tokens are not refreshed. An API key uses
+ordinary pay-per-token Messages requests:
+
+```sh
+export ANTHROPIC_API_KEY='your-api-key'
+cxplr --engine anthropic --model claude-sonnet-5-5 --index
+```
+
+cxplr never reads or rotates Claude Code's credentials. The OAuth transport follows
+[oh-my-pi's Anthropic integration](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/providers/anthropic.ts):
+Claude Code's OAuth headers, identity and billing fingerprint, prefixed tool names,
+and prompt caching. This is a third-party compatibility integration, not an
+Anthropic-supported API contract for subscriptions; availability remains subject to
+Anthropic's policies and client checks. `CXPLR_CLAUDE_CODE_VERSION` overrides the
+pinned wire version; otherwise cxplr adopts a newer minimum once if Anthropic
+explicitly requires one. API-key mode sends none of the Claude Code OAuth identity.
+Attribution is in `LICENSE-oh-my-pi`.
+
+The native agent can read numbered file ranges, search with bounded regexes, glob
+files and list directories. It cannot execute commands or change the repository.
+Searches and listings respect ignore files; explicit reads may open ignored files
+inside the repository. Tool-state directories and symlink escapes are refused.
+Output is capped so one tool call cannot dump an entire large project into context.
+Final answers are schema-validated before cxplr verifies their citations. Usage
+totals include uncached input, cache writes and cache reads; the displayed cached
+portion is cache reads only.
+
 
 ## Install
 
@@ -73,7 +126,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.6.0 is available (you have 0.5.0): run `cxplr --update`
+cxplr 0.7.0 is available (you have 0.6.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -88,8 +141,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.6.0"
-git tag v0.6.0 && git push && git push --tags
+cargo build && git commit -am "Release 0.7.0"
+git tag v0.7.0 && git push origin main v0.7.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -337,11 +390,14 @@ flowchart TD
   changed files, re-reads them and returns the updated map instead of exploring from
   scratch. If that session no longer exists, the map is explored afresh.
 - Questions and example inputs fork the session of the map you are viewing.
-- Sessions are persisted by the engine (forking requires it) and named
-  `cxplr: <repo> › …`. Each map shows its session id; `codex resume <id>` or
-  `claude --resume <id>` (from the repository directory) continues it interactively.
-  With Claude Code, cxplr picks each session's id and creates a fork on its first turn
-  (`--resume <parent> --fork-session --session-id <id>`).
+- CLI sessions are persisted by their agent and named `cxplr: <repo> › …`. Each map
+  shows its session id; `codex resume <id>` or `claude --resume <id>` (from the
+  repository directory) continues a CLI session interactively. With Claude Code,
+  cxplr picks each id and creates a fork on its first turn.
+- Native Anthropic sessions are private JSON histories in
+  `<cache>/anthropic-sessions/`. Forks copy the parent's completed exchanges;
+  follow-ups and refreshes resume them, including after restarting cxplr. They are
+  not Claude Code transcripts and cannot be opened with `claude --resume`.
 - `--forget-sessions` deletes every session of the selected engine that cxplr created
   for the project; cached maps stay, and later work starts new sessions.
 
@@ -356,7 +412,8 @@ checkouts.
 | `maps/<key>.json` | One map per key |
 | `scopes/<hash>.json` | Latest map of a scope: its paths, file manifest and session |
 | `traces/<key>.json` | Example inputs per map content and flow |
-| `sessions.json`, `sessions-claude.json` | Codex / Claude Code sessions cxplr created (for `--forget-sessions`) |
+| `sessions.json`, `sessions-claude.json`, `sessions-anthropic.json` | Per-engine session registries (for `--forget-sessions`) |
+| `anthropic-sessions/<id>.json` | Private native Anthropic conversation histories |
 | `atlas/` | The Markdown atlas |
 
 A map's key is its scope plus the content of every file it covers (git blob hashes of
@@ -384,6 +441,11 @@ Delete `.cxplr/` to start over.
   use MCP servers or load hooks and other settings from `~/.claude` or the repository's
   `.claude/`. Managed (enterprise) settings still apply, and the repository's
   `CLAUDE.md` is read as context.
+- Native Anthropic exposes only repository-confined read/list/search tools. It
+  never executes repository code or loads project hooks, skills or MCP servers.
+  Code and tool outputs are sent to Anthropic. Native session files contain the
+  resulting conversation and source excerpts, are mode 0600, and can be removed
+  with `--engine anthropic --forget-sessions`.
 - The web server listens on loopback by default; the source endpoint only serves paths
   that resolve inside the repository, and symlinks leading outside are refused.
 
@@ -401,10 +463,11 @@ cxplr [REPO] [OPTIONS]
 | `--port N` | 7878 | Web UI port |
 | `--host ADDR` | 127.0.0.1 | Address to listen on; keep it on loopback |
 | `--open` | | Open the browser once serving (always after `--index`) |
-| `--engine codex\|claude` | `codex` | Agent that explores (see [Engines](#engines)) |
-| `--model NAME` | engine config | Model; Claude Code also takes aliases (`sonnet`, `opus`) |
+| `--engine codex\|claude\|anthropic` | `codex` | Agent that explores (see [Engines](#engines)) |
+| `--model NAME` | CLI config / `claude-sonnet-5-5` | Model; CLI Claude also takes aliases (`sonnet`, `opus`) |
 | `--codex PATH` | `codex` | Codex executable (run as `codex app-server`) |
 | `--claude PATH` | `claude` | Claude Code executable (run as `claude -p`) |
+| `--anthropic-login` | | Browser OAuth login for native Anthropic; saves refreshable credentials and exits |
 | `--timeout-mins N` | 20 | Limit for one exploration, question or example run |
 | `--cache-dir DIR` | `REPO/.cxplr` | Cache location |
 | `--lsp LANG=COMMAND` | auto | Language server per language (`rust`, `python`, `typescript`, `go`, `c`, `scala`); empty command disables |

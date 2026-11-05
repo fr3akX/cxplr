@@ -10,8 +10,8 @@
 //!   served, marked stale with exactly which files changed, until it is refreshed.
 //! - `traces/<key>.json`: example inputs for one flow, keyed by the scope's content
 //!   key and the flow name.
-//! - `sessions.json` (Codex) / `sessions-claude.json` (Claude Code): every session
-//!   cxplr created (id → name), so they can be deleted with `--forget-sessions`.
+//! - `sessions.json` (Codex), `sessions-claude.json`, `sessions-anthropic.json`:
+//!   sessions cxplr created (id → name), deleted with `--forget-sessions`.
 
 use crate::engine::Kind;
 use crate::map::Map;
@@ -201,7 +201,7 @@ impl Cache {
         for entry in fs::read_dir(self.dir.join("scopes"))?.filter_map(Result::ok) {
             let Ok(bytes) = fs::read(entry.path()) else { continue };
             let Ok(mut b) = serde_json::from_slice::<Binding>(&bytes) else { continue };
-            if b.session.as_ref().is_some_and(|s| deleted.contains(s)) {
+            if b.engine.as_deref().unwrap_or("codex") == self.engine && b.session.as_ref().is_some_and(|s| deleted.contains(s)) {
                 b.session = None;
                 write_atomic(&entry.path(), &serde_json::to_vec(&b)?)?;
             }

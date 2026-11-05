@@ -1,10 +1,11 @@
-//! The agent that explores: Codex (`codex app-server`) or Claude Code (`claude -p`).
+//! Engines: Codex app-server, Claude Code CLI, or native Anthropic Messages.
 //!
-//! Both keep persisted, read-only sessions. cxplr arranges them in a tree that
+//! All keep persisted, read-only sessions. cxplr arranges them in a tree that
 //! mirrors the map (see `explore.rs`): a component is explored in a fork of its
 //! parent's session, questions fork the session of the map being viewed, and
 //! follow-ups continue their own session.
 
+use crate::anthropic::Anthropic;
 use crate::claude::Claude;
 use crate::codex::Codex;
 use serde::de::DeserializeOwned;
@@ -19,6 +20,7 @@ pub const SESSION_GONE: &str = "session not found";
 pub enum Kind {
     Codex,
     Claude,
+    Anthropic,
 }
 
 impl Kind {
@@ -27,6 +29,7 @@ impl Kind {
         match self {
             Kind::Codex => "codex",
             Kind::Claude => "claude",
+            Kind::Anthropic => "anthropic",
         }
     }
 }
@@ -43,6 +46,7 @@ pub struct Outcome<T> {
 pub enum Engine {
     Codex(Arc<Codex>),
     Claude(Arc<Claude>),
+    Anthropic(Arc<Anthropic>),
 }
 
 impl Engine {
@@ -50,6 +54,7 @@ impl Engine {
         match self {
             Engine::Codex(_) => Kind::Codex,
             Engine::Claude(_) => Kind::Claude,
+            Engine::Anthropic(_) => Kind::Anthropic,
         }
     }
 
@@ -57,6 +62,7 @@ impl Engine {
         match self {
             Engine::Codex(c) => c.model(),
             Engine::Claude(c) => c.model(),
+            Engine::Anthropic(c) => c.model(),
         }
     }
 
@@ -65,6 +71,7 @@ impl Engine {
         match self {
             Engine::Codex(c) => c.start_thread(name).await,
             Engine::Claude(c) => c.start_session(name),
+            Engine::Anthropic(c) => c.start_session(name),
         }
     }
 
@@ -73,6 +80,7 @@ impl Engine {
         match self {
             Engine::Codex(c) => c.fork(parent, name).await,
             Engine::Claude(c) => c.fork(parent, name),
+            Engine::Anthropic(c) => c.fork(parent, name),
         }
     }
 
@@ -81,6 +89,7 @@ impl Engine {
         match self {
             Engine::Codex(c) => c.delete_thread(id).await,
             Engine::Claude(c) => c.delete_session(id),
+            Engine::Anthropic(c) => c.delete_session(id),
         }
     }
 
@@ -96,6 +105,7 @@ impl Engine {
         let out = match self {
             Engine::Codex(c) => c.turn(session, prompt, schema, cancel, progress).await?,
             Engine::Claude(c) => c.turn(session, prompt, schema, cancel, progress).await?,
+            Engine::Anthropic(c) => c.turn(session, prompt, schema, cancel, progress).await?,
         };
         let answer = T::deserialize(&out.answer).map_err(|e| {
             format!("{} answer does not match the schema ({e}): {}", self.kind().id(), one_line(&out.answer.to_string(), 400))

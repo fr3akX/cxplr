@@ -78,11 +78,11 @@ pub struct Meta {
     /// Input tokens served from the provider's cache (shared session context).
     #[serde(default)]
     pub cached_input_tokens: u64,
-    /// Session the map was made in (`codex resume <id>` or `claude --resume <id>`
-    /// continues it, depending on `engine`).
+    /// Session the map was made in. Native Anthropic sessions resume through cxplr;
+    /// CLI sessions also support `codex resume` or `claude --resume`.
     #[serde(default)]
     pub session: Option<String>,
-    /// `codex` or `claude`; absent in maps made before Claude Code support (Codex).
+    /// `codex`, `claude`, or `anthropic`; absent in older Codex maps.
     #[serde(default)]
     pub engine: Option<String>,
     /// Refreshed in its existing session rather than explored from scratch.

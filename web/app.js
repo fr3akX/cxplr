@@ -29,7 +29,12 @@ function esc(text) {
 
 /** The agent that explores, as named in the UI. */
 function engineName() {
-  return state.repo?.engine === 'claude' ? 'Claude Code' : 'Codex';
+  return { codex: 'Codex', claude: 'Claude Code', anthropic: 'Claude (native)' }[state.repo?.engine] || 'Codex';
+}
+
+function sessionHint(meta) {
+  if (meta.engine === 'anthropic') return 'Native Anthropic session; follow-ups and refresh resume it through cxplr';
+  return `Continue it in a terminal: ${meta.engine === 'claude' ? 'claude --resume' : 'codex resume'} ${meta.session}`;
 }
 
 /** Minimal inline formatting: `code`, **bold**, paragraphs. Input is escaped first. */
@@ -781,7 +786,7 @@ function renderPanelContent() {
       ${meta?.commit ? `Commit <code>${esc(meta.commit.slice(0, 10))}</code>${meta.dirty ? ' <span class="warn">(uncommitted changes)</span>' : ''} · ` : ''}
       ${meta ? `${new Date(meta.generated_at * 1000).toLocaleString()} · ${meta.refreshed ? 'refreshed in ' : ''}${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in${meta.cached_input_tokens ? ` (${fmtTokens(meta.cached_input_tokens)} cached)` : ''} / ${fmtTokens(meta.output_tokens)} out tokens` : ''}
       ${meta?.model ? ` · ${esc(meta.model)}` : ''}
-      ${meta?.session ? ` · session <code title="Continue it in a terminal: ${meta.engine === 'claude' ? 'claude --resume' : 'codex resume'} ${esc(meta.session)}">${esc(meta.session.slice(0, 8))}</code>` : ''}
+      ${meta?.session ? ` · session <code title="${esc(sessionHint(meta))}">${esc(meta.session.slice(0, 8))}</code>` : ''}
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>

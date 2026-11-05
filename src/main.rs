@@ -1,3 +1,7 @@
+mod anthropic;
+mod anthropic_auth;
+mod anthropic_tools;
+mod anthropic_wire;
 mod ask;
 mod atlas;
 mod cache;
@@ -35,11 +39,10 @@ struct Args {
     host: String,
     #[arg(long, default_value_t = 7878)]
     port: u16,
-    /// Agent that explores: `codex` (codex app-server) or `claude` (Claude Code, `claude -p`)
+    /// Agent: codex app-server, claude -p, or native Anthropic Messages
     #[arg(long, value_enum, default_value = "codex")]
     engine: engine::Kind,
-    /// Model (default: the model in your Codex or Claude Code config); Claude Code
-    /// also takes aliases such as `sonnet` or `opus`
+    /// Model (CLI engines use their config; native Anthropic defaults to claude-sonnet-5-5)
     #[arg(long)]
     model: Option<String>,
     /// Codex executable (run as `codex app-server`)
@@ -48,6 +51,9 @@ struct Args {
     /// Claude Code executable (run as `claude -p`)
     #[arg(long, default_value = "claude")]
     claude: String,
+    /// Sign into native Anthropic with Claude subscription OAuth and exit
+    #[arg(long)]
+    anthropic_login: bool,
     /// Time limit for one exploration or question, in minutes
     #[arg(long, default_value_t = 20)]
     timeout_mins: u64,
@@ -180,6 +186,10 @@ fn raise_open_file_limit() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    if args.anthropic_login {
+        anthropic_auth::login().await?;
+        return Ok(());
+    }
     if args.update {
         // The new binary refreshes an installed skill on its first start.
         println!("{}", update::update_now().await?);
@@ -205,17 +215,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raise_open_file_limit();
     let repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
-    let cache = cache::Cache::open(cache_dir.clone(), args.engine, args.model.as_deref())
+    let model = match (args.engine, args.model) {
+        (engine::Kind::Anthropic, None) => Some(anthropic::DEFAULT_MODEL.to_owned()),
+        (_, model) => model,
+    };
+    let cache = cache::Cache::open(cache_dir.clone(), args.engine, model.as_deref())
         .map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
     let timeout = Duration::from_secs(args.timeout_mins.max(1) * 60);
     let engine = match args.engine {
         engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: args.codex, model: args.model, timeout };
+            let cfg = codex::CodexConfig { bin: args.codex, model, timeout };
             engine::Engine::Codex(codex::Codex::start(cfg, &repo.root).await?)
         }
         engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: args.claude, model: args.model, timeout };
+            let cfg = claude::ClaudeConfig { bin: args.claude, model, timeout };
             engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, &repo.root).await?))
+        }
+        engine::Kind::Anthropic => {
+            let native = anthropic::Anthropic::start(&repo.root, &cache_dir, model, timeout).await?;
+            engine::Engine::Anthropic(Arc::new(native))
         }
     };
     let ex = Arc::new(explore::Explorer { repo, cache, engine });

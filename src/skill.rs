@@ -38,7 +38,7 @@ When the task needs an understanding of how the code is organised:
 fn skill_path(engine: Kind) -> io::Result<PathBuf> {
     let (var, default) = match engine {
         Kind::Codex => ("CODEX_HOME", ".codex"),
-        Kind::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Kind::Claude | Kind::Anthropic => ("CLAUDE_CONFIG_DIR", ".claude"),
     };
     let home = env::var_os(var)
         .filter(|v| !v.is_empty())
