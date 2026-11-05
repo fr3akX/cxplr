@@ -73,7 +73,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.5.0 is available (you have 0.4.0): run `cxplr --update`
+cxplr 0.6.0 is available (you have 0.5.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -88,8 +88,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.5.0"
-git tag v0.5.0 && git push && git push --tags
+cargo build && git commit -am "Release 0.6.0"
+git tag v0.6.0 && git push && git push --tags
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
