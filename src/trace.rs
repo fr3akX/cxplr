@@ -93,9 +93,9 @@ pub fn schema() -> Value {
 pub fn prompt(map: &Map, flow: &Flow) -> String {
     let mut p = String::from(
         "You are helping a developer learn a repository by watching concrete inputs travel \
-through it. The repository root is the current working directory. Investigate with read-only \
-shell commands (ls, rg, sed -n, nl -ba, cat). Do not modify files, install packages, or run \
-the project's code, builds or tests.
+through it. The repository root is the current working directory. Investigate read-only \
+(shell commands such as ls, rg, sed -n and nl -ba, or file read and search tools). Do not \
+modify files, install packages, or run the project's code, builds or tests.
 
 Return ONLY the JSON object required by the output schema.
 ",
@@ -128,7 +128,7 @@ may stop early or leave the listed flow where the code branches.
 most 300 characters).
 - action: what happens on the hop, including the condition that sends this input this way.
 - evidence: 1-2 citations per step (repository-relative path and the 1-based line you read in \
-`nl -ba` or `rg -n` output) showing the branch or transformation.
+tool output that shows line numbers) showing the branch or transformation.
 ",
     );
     p

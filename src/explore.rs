@@ -1,23 +1,22 @@
 //! Exploring one scope (system map or a component one level deeper), shared by
 //! the web server and the full-project indexer.
 //!
-//! Sessions mirror the map tree: the system map is explored in a new Codex
-//! session, each component in a fork of its parent's session, and a stale map is
+//! Sessions mirror the map tree: the system map is explored in a new session,
+//! each component in a fork of its parent's session, and a stale map is
 //! refreshed inside the session that made it.
 
 use crate::cache::{Cache, Freshness};
-use crate::codex::Codex;
+use crate::engine::{self, Engine};
 use crate::map::{self, Map, Meta, Node};
 use crate::repo::Repo;
 use crate::{prompt, verify};
-use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 pub struct Explorer {
     pub repo: Repo,
     pub cache: Cache,
-    pub codex: Arc<Codex>,
+    pub engine: Engine,
 }
 
 /// Everything needed to explore a scope below the system map.
@@ -78,7 +77,7 @@ impl Explorer {
     /// what that exploration read), otherwise a fresh session.
     pub async fn session_from(&self, from: Option<&str>, name: &str, progress: &mut impl FnMut(String)) -> Result<String, String> {
         if let Some(parent) = from.and_then(|s| self.cache.session(s)) {
-            match self.codex.fork(&parent, name).await {
+            match self.engine.fork(&parent, name).await {
                 Ok(id) => {
                     self.record(&id, name);
                     progress(format!("Continuing from session {parent} (forked as {id})"));
@@ -88,7 +87,7 @@ impl Explorer {
                 Err(e) => progress(format!("! cannot fork session {parent}: {e}; starting a new session")),
             }
         }
-        let id = self.codex.start_thread(name).await?;
+        let id = self.engine.start_session(name).await?;
         self.record(&id, name);
         progress(format!("New session {id}"));
         Ok(id)
@@ -99,7 +98,7 @@ impl Explorer {
         let _ = self.cache.record_session(id, name);
     }
 
-    /// Explore a scope with Codex, verify the answer and store it in the cache.
+    /// Explore a scope, verify the answer and store it in the cache.
     pub async fn explore(
         &self,
         scope: &str,
@@ -134,20 +133,20 @@ impl Explorer {
                 (session, prompt::refresh(&changed, total), true)
             }
             _ => {
-                progress(format!("Exploring {label} with codex (read-only sandbox)"));
+                progress(format!("Exploring {label} with {} (read-only)", self.engine.kind().id()));
                 let session = self.session_from(parent_scope(scope), &name, &mut progress).await?;
                 (session, full_prompt.clone(), false)
             }
         };
 
         let started = Instant::now();
-        let (session, refreshed, out) = match self.codex.turn::<Map>(&session, &prompt, &map::schema(), cancel, &mut progress).await {
+        let (session, refreshed, out) = match self.engine.turn::<Map>(&session, &prompt, &map::schema(), cancel, &mut progress).await {
             Ok(out) => (session, refreshed, out),
             // The map's session no longer exists (deleted): explore from scratch instead.
-            Err(e) if refreshed && e.starts_with("thread/resume") => {
+            Err(e) if refreshed && e.starts_with(engine::SESSION_GONE) => {
                 progress(format!("! session {session} is gone ({e}); exploring from scratch"));
                 let fresh = self.session_from(parent_scope(scope), &name, &mut progress).await?;
-                let out = self.codex.turn::<Map>(&fresh, &full_prompt, &map::schema(), cancel, &mut progress).await?;
+                let out = self.engine.turn::<Map>(&fresh, &full_prompt, &map::schema(), cancel, &mut progress).await?;
                 (fresh, false, out)
             }
             Err(e) => return Err(e),
@@ -167,13 +166,14 @@ impl Explorer {
             generated_at: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
             commit: commit.clone(),
             dirty: self.repo.is_dirty(),
-            model: self.codex.model().map(str::to_owned),
+            model: self.engine.model().map(str::to_owned),
             duration_ms: started.elapsed().as_millis() as u64,
             commands: out.commands,
             input_tokens: out.input_tokens,
             output_tokens: out.output_tokens,
             cached_input_tokens: out.cached_input_tokens,
             session: Some(session.clone()),
+            engine: Some(self.engine.kind().id().to_owned()),
             refreshed,
         });
         self.cache

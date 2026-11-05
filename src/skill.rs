@@ -1,6 +1,8 @@
-//! The cxplr skill for Codex: tells any Codex session working in a repository
-//! with a cxplr atlas to orient from it before exploring.
+//! The cxplr skill for Codex and Claude Code: tells any session working in a
+//! repository with a cxplr atlas to orient from it before exploring. Both read
+//! `skills/<name>/SKILL.md` with the same frontmatter from their config directory.
 
+use crate::engine::Kind;
 use std::path::PathBuf;
 use std::{env, fs, io};
 
@@ -32,27 +34,37 @@ When the task needs an understanding of how the code is organised:
    with `cxplr <repository> --index`.
 "#;
 
-fn skill_path() -> io::Result<PathBuf> {
-    let home = env::var_os("CODEX_HOME")
+/// `$CODEX_HOME` (default `~/.codex`) or `$CLAUDE_CONFIG_DIR` (default `~/.claude`).
+fn skill_path(engine: Kind) -> io::Result<PathBuf> {
+    let (var, default) = match engine {
+        Kind::Codex => ("CODEX_HOME", ".codex"),
+        Kind::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
+    };
+    let home = env::var_os(var)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "neither CODEX_HOME nor HOME is set"))?;
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(default)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("neither {var} nor HOME is set")))?;
     Ok(home.join("skills").join("cxplr").join("SKILL.md"))
 }
 
-/// Write the skill to `$CODEX_HOME/skills/cxplr/SKILL.md` (default `~/.codex`).
-pub fn install() -> io::Result<PathBuf> {
-    let path = skill_path()?;
+/// Write the skill to `<engine config dir>/skills/cxplr/SKILL.md`.
+pub fn install(engine: Kind) -> io::Result<PathBuf> {
+    let path = skill_path(engine)?;
     fs::create_dir_all(path.parent().expect("skill path has a parent"))?;
     fs::write(&path, SKILL)?;
     Ok(path)
 }
 
-/// Keep an installed skill in step with this version of cxplr (e.g. after an update).
-/// Returns the path when it was rewritten.
-pub fn refresh_if_installed() -> Option<PathBuf> {
-    let path = skill_path().ok()?;
-    let current = fs::read_to_string(&path).ok()?;
-    (current != SKILL).then(|| fs::write(&path, SKILL).ok().map(|()| path)).flatten()
+/// Keep installed skills in step with this version of cxplr (e.g. after an update).
+/// Returns the paths that were rewritten.
+pub fn refresh_installed() -> Vec<PathBuf> {
+    [Kind::Codex, Kind::Claude]
+        .into_iter()
+        .filter_map(|engine| {
+            let path = skill_path(engine).ok()?;
+            let current = fs::read_to_string(&path).ok()?;
+            (current != SKILL).then(|| fs::write(&path, SKILL).ok().map(|()| path)).flatten()
+        })
+        .collect()
 }

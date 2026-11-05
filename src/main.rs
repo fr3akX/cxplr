@@ -1,7 +1,9 @@
 mod ask;
 mod atlas;
 mod cache;
+mod claude;
 mod codex;
+mod engine;
 mod explore;
 mod index;
 mod lsp;
@@ -33,12 +35,19 @@ struct Args {
     host: String,
     #[arg(long, default_value_t = 7878)]
     port: u16,
-    /// Codex model (default: the model in your Codex config)
+    /// Agent that explores: `codex` (codex app-server) or `claude` (Claude Code, `claude -p`)
+    #[arg(long, value_enum, default_value = "codex")]
+    engine: engine::Kind,
+    /// Model (default: the model in your Codex or Claude Code config); Claude Code
+    /// also takes aliases such as `sonnet` or `opus`
     #[arg(long)]
     model: Option<String>,
     /// Codex executable (run as `codex app-server`)
     #[arg(long, default_value = "codex")]
     codex: String,
+    /// Claude Code executable (run as `claude -p`)
+    #[arg(long, default_value = "claude")]
+    claude: String,
     /// Time limit for one exploration or question, in minutes
     #[arg(long, default_value_t = 20)]
     timeout_mins: u64,
@@ -76,12 +85,13 @@ struct Args {
     /// runs the build tool, e.g. sbt, on the repository). Off: Scala stays read-only
     #[arg(long)]
     lsp_import_build: bool,
-    /// Delete every Codex session cxplr created for this project and exit
-    /// (cached maps are kept; later explorations start new sessions)
+    /// Delete every session of the selected engine cxplr created for this project and
+    /// exit (cached maps are kept; later explorations start new sessions)
     #[arg(long)]
     forget_sessions: bool,
-    /// Install the cxplr skill for Codex ($CODEX_HOME/skills/cxplr/SKILL.md) and exit;
-    /// it points Codex sessions at `.cxplr/atlas` in repositories that have one
+    /// Install the cxplr skill for the selected engine
+    /// (`<config dir>/skills/cxplr/SKILL.md`) and exit; it points that agent's
+    /// sessions at `.cxplr/atlas` in repositories that have one
     #[arg(long)]
     install_skill: bool,
     /// Install the latest release now (for installs made with the release installer) and exit
@@ -176,11 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.install_skill {
-        let path = skill::install()?;
+        let path = skill::install(args.engine)?;
         println!("installed the cxplr skill at {}", path.display());
         return Ok(());
     }
-    if let Some(path) = skill::refresh_if_installed() {
+    for path in skill::refresh_installed() {
         println!("updated the cxplr skill at {}", path.display());
     }
     if !args.no_update {
@@ -195,17 +205,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     raise_open_file_limit();
     let repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
-    let cache = cache::Cache::open(cache_dir.clone(), args.model.as_deref())
+    let cache = cache::Cache::open(cache_dir.clone(), args.engine, args.model.as_deref())
         .map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
-    let codex = codex::Codex::start(
-        codex::CodexConfig { bin: args.codex, model: args.model, timeout: Duration::from_secs(args.timeout_mins.max(1) * 60) },
-        &repo.root,
-    )
-    .await?;
-    let ex = Arc::new(explore::Explorer { repo, cache, codex });
+    let timeout = Duration::from_secs(args.timeout_mins.max(1) * 60);
+    let engine = match args.engine {
+        engine::Kind::Codex => {
+            let cfg = codex::CodexConfig { bin: args.codex, model: args.model, timeout };
+            engine::Engine::Codex(codex::Codex::start(cfg, &repo.root).await?)
+        }
+        engine::Kind::Claude => {
+            let cfg = claude::ClaudeConfig { bin: args.claude, model: args.model, timeout };
+            engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, &repo.root).await?))
+        }
+    };
+    let ex = Arc::new(explore::Explorer { repo, cache, engine });
 
     let commit = ex.repo.head().map_or("no git commit".to_owned(), |c| c[..c.len().min(12)].to_owned());
-    println!("cxplr: {} ({commit}), cache {}", ex.repo.root.display(), cache_dir.display());
+    println!("cxplr: {} ({commit}), engine {}, cache {}", ex.repo.root.display(), args.engine.id(), cache_dir.display());
 
     if args.forget_sessions {
         let sessions = ex.cache.sessions();
@@ -220,13 +236,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let before = pending.len();
             let mut blocked = Vec::new();
             for (id, name) in pending {
-                match ex.codex.delete_thread(id).await {
+                match ex.engine.delete_session(id).await {
                     Ok(()) => {
                         println!("  deleted {id} ({name})");
                         deleted.push(id.clone());
                     }
-                    // Already gone (e.g. deleted in Codex): forget it too.
-                    Err(e) if e.contains("no rollout") || e.contains("not found") => deleted.push(id.clone()),
                     Err(e) => {
                         errors.push(format!("  ✗ {id} ({name}): {e}"));
                         blocked.push((id, name));

@@ -27,7 +27,7 @@ pub struct AppState {
     jobs: Mutex<Jobs>,
 }
 
-/// Handlers use the explorer's repository, cache and Codex sessions directly.
+/// Handlers use the explorer's repository, cache and engine sessions directly.
 impl std::ops::Deref for AppState {
     type Target = Explorer;
     fn deref(&self) -> &Explorer {
@@ -157,7 +157,8 @@ async fn repo_info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "name": st.repo.name,
         "root": st.repo.root,
         "commit": st.repo.head(),
-        "model": st.codex.model(),
+        "engine": st.engine.kind().id(),
+        "model": st.engine.model(),
         "cache": st.cache.dir(),
     }))
 }
@@ -312,7 +313,7 @@ async fn answer_question(
     let view = ask::View { crumbs, map: map.as_ref(), node, selection };
     let prompt = ask::prompt(&st.repo.name, &view, &req.question, follow_up);
     let started = Instant::now();
-    let out = st.codex.turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
+    let out = st.engine.turn::<ask::Answer>(&session, &prompt, &ask::schema(), &job.cancel, &mut progress).await?;
     let mut answer = out.answer;
     verify::verify_citations(&st.repo.root, &mut answer.citations);
     Ok(json!({
@@ -377,12 +378,12 @@ async fn start_trace(State(st): State<Arc<AppState>>, Json(req): Json<TraceReque
 async fn generate_trace(st: &AppState, job: &Job, scope: &str, map: &crate::map::Map, flow: usize) -> Result<Value, String> {
     let flow = &map.flows[flow];
     let mut progress = |line: String| job.push(line);
-    progress(format!("Tracing example inputs through “{}” with codex (read-only sandbox)", flow.name));
+    progress(format!("Tracing example inputs through “{}” with {} (read-only)", flow.name, st.engine.kind().id()));
     let name = st.session_name(&format!("examples · {}", flow.name));
     let session = st.session_from(Some(scope), &name, &mut progress).await?;
     let started = Instant::now();
     let prompt = trace::prompt(map, flow);
-    let out = st.codex.turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
+    let out = st.engine.turn::<trace::Traces>(&session, &prompt, &trace::schema(), &job.cancel, &mut progress).await?;
     let mut traces = out.answer;
     traces.diagnostics.clear();
     trace::normalize(&mut traces, map);

@@ -14,21 +14,45 @@ cited source lines, in a local web UI.
   in file and across the repository, syntax highlighting and code navigation through
   language servers (Rust, Python, TS/JS, Go, C/C++, Scala), with text-search fallback.
 - **Ask questions** inline under selected code or about the current map; follow-ups
-  continue the same Codex session.
-- **Atlas**: every map as Markdown in `.cxplr/atlas/`, plus a Codex skill so your other
-  Codex sessions can use it.
+  continue the same agent session.
+- **Atlas**: every map as Markdown in `.cxplr/atlas/`, plus a Codex / Claude Code skill
+  so your other sessions can use it.
 
-The exploration is done by [Codex](https://github.com/openai/codex) through a
-long-lived `codex app-server`, in read-only sessions that form a tree mirroring the
-map (see [Codex sessions](#codex-sessions)).
+The exploration is done by [Codex](https://github.com/openai/codex) (default) or
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code), in read-only sessions
+that form a tree mirroring the map (see [Engines](#engines) and [Sessions](#sessions)).
 
 ## Requirements
 
 - Linux or macOS (x86_64 or arm64).
-- `codex` on `PATH`, logged in, with `codex app-server` (experimental in Codex 0.166;
-  cxplr stops with a clear error if it is missing). Model and reasoning effort come from
-  your Codex config unless `--model` is given.
+- One engine, logged in:
+  - `codex` on `PATH` with `codex app-server` (experimental in Codex 0.166), or
+  - `claude` (Claude Code) on `PATH`, with `--restricted` (Claude Code 2.1.3xx;
+    `claude update` otherwise), for `--engine claude`.
+
+  cxplr stops with a clear error if the engine is missing or too old. Model and
+  reasoning effort come from the engine's own config unless `--model` is given.
 - Optional: language servers for code navigation (see [Source viewer](#source-viewer)).
+
+## Engines
+
+| | `--engine codex` (default) | `--engine claude` |
+| --- | --- | --- |
+| Runs | one long-lived `codex app-server` | `claude -p` per turn (headless Claude Code) |
+| Account | your Codex login | your Claude Code login (Claude subscription or API key) |
+| Tools | read-only shell commands (`rg`, `sed -n`, `nl -ba`, …) | `Read`, `Grep`, `Glob` only |
+| Isolation | `sandbox: read-only`, approvals off, hooks/plugins/apps/memories/browser disabled | `--restricted`: no command-running tools, no MCP servers, no settings files (so no hooks) from the user or the repository, file tools confined to the repository |
+| Sessions | Codex threads (`codex resume <id>`) | Claude Code sessions (`claude --resume <id>`) |
+| `--model` | Codex model | Claude model or alias (`sonnet`, `opus`, …) |
+
+```sh
+cxplr --engine claude --index      # map the project with Claude Code
+cxplr --engine claude --model opus # browse and ask with Opus
+```
+
+Each engine has its own cache keys and sessions: maps made with one show as stale under
+the other until refreshed, and sessions are never shared across engines. Maps made by
+Codex before this option existed keep their keys.
 
 ## Install
 
@@ -52,8 +76,8 @@ background and prints a one-line notice when a newer version exists:
 cxplr 0.5.0 is available (you have 0.4.0): run `cxplr --update`
 ```
 
-`cxplr --update` downloads and installs it with the same installer; an installed Codex
-skill is refreshed on the first start of the new version. `--no-update`, or
+`cxplr --update` downloads and installs it with the same installer; installed cxplr
+skills are refreshed on the first start of the new version. `--no-update`, or
 `CXPLR_NO_UPDATE=1`, skips the check. Builds from source are not checked; update them
 by re-running `cargo install`.
 
@@ -80,7 +104,7 @@ cxplr /path/to/repo           # later: browse the cache at http://127.0.0.1:7878
 ```
 
 `--index` prints progress for each exploration and opens the browser when done.
-Browsing reads only from the cache and never calls Codex on its own: a level that has
+Browsing reads only from the cache and never runs the engine on its own: a level that has
 not been explored shows **Explore now**, and a stale map offers **Refresh**.
 
 ## Indexing
@@ -125,7 +149,7 @@ tokens); raise `--min-lines` to keep the hierarchy coarser.
 - Drag a box to move it when labels overlap; edges follow. Positions are kept per map
   in browser storage; **Reset layout** discards them.
 - A stale map shows which files changed since it was made; **Refresh** updates it
-  (see [Codex sessions](#codex-sessions)). **Re-explore** maps a fresh level again.
+  (see [Sessions](#sessions)). **Re-explore** maps a fresh level again.
 - Mouse wheel zooms, dragging the background pans, **Fit** or `F` fits the map, the
   **Edge labels** checkbox hides labels, `Esc` clears the selection.
 
@@ -144,7 +168,7 @@ Simulations run on any map that has data flows, from the **Details** tab:
 **Example inputs** show different branches rather than identical tokens:
 
 1. Click a flow's name to select it.
-2. Under **Example inputs**, click **Generate example inputs**. Codex (read-only, about
+2. Under **Example inputs**, click **Generate example inputs**. The engine (read-only, about
    1–3 minutes) writes 2–5 concrete inputs that take different paths: the normal path,
    rejections, failures, retries, only where the code really branches. The result is
    cached; **Regenerate** asks again.
@@ -262,14 +286,14 @@ and ✕ hides it.
 selected component, and lists all code threads (click one to jump to it).
 
 A conversation's first question forks the session that explored the current map;
-follow-ups continue that session, so Codex remembers what it read and answered (a
+follow-ups continue that session, so the agent remembers what it read and answered (a
 follow-up typically runs few or no commands, with most input cached). The Ask tab's
 **Conversation** chip shows this; its ✕ starts a new conversation from the map you are
 on. Answers are Markdown; every `path:line` opens the source viewer, and citations are
 checked against the files like map evidence. Conversations live in the page and are
-cleared on reload; their Codex sessions remain.
+cleared on reload; their sessions remain.
 
-## Atlas and the Codex skill
+## Atlas and the skill
 
 Every cached map is also written as Markdown to `.cxplr/atlas/`, laid out like the map
 hierarchy, for people and other agents:
@@ -285,16 +309,17 @@ none), interactions, data flows and `path:line` citations. The atlas is rebuilt 
 cxplr starts, after indexing and after each exploration from the browser.
 
 ```sh
-cxplr --install-skill    # writes $CODEX_HOME/skills/cxplr/SKILL.md (default ~/.codex)
+cxplr --install-skill                  # $CODEX_HOME/skills/cxplr/SKILL.md (default ~/.codex)
+cxplr --engine claude --install-skill  # $CLAUDE_CONFIG_DIR/skills/cxplr/SKILL.md (default ~/.claude)
 ```
 
-The skill tells any Codex session in a repository with `.cxplr/atlas/README.md` to
-orient from the atlas before exploring: start at the system page, follow links to the
-relevant component, open citations before relying on them, and read the changed files
-of stale pages directly. Codex decides when to load a skill, so this is guidance, not
-enforcement. Re-run `--install-skill` after upgrading cxplr.
+The skill tells any Codex or Claude Code session in a repository with
+`.cxplr/atlas/README.md` to orient from the atlas before exploring: start at the system
+page, follow links to the relevant component, open citations before relying on them, and
+read the changed files of stale pages directly. The agent decides when to load a skill,
+so this is guidance, not enforcement. cxplr refreshes installed skills when it starts.
 
-## Codex sessions
+## Sessions
 
 ```mermaid
 flowchart TD
@@ -308,15 +333,17 @@ flowchart TD
   session of the map it appears in. It starts with its ancestors' exploration in
   context (and largely in the provider's prompt cache), while siblings still run in
   parallel.
-- A stale map is refreshed **inside its own session**: Codex gets the exact list of
+- A stale map is refreshed **inside its own session**: the agent gets the exact list of
   changed files, re-reads them and returns the updated map instead of exploring from
   scratch. If that session no longer exists, the map is explored afresh.
 - Questions and example inputs fork the session of the map you are viewing.
-- Sessions are persisted by Codex (forking requires it) and named
-  `cxplr: <repo> › …`, so they appear in `codex resume`. Each map shows its session id;
-  `codex resume <id>` continues it interactively. `--forget-sessions` deletes every
-  session cxplr created for the project; cached maps stay, and later work starts new
-  sessions.
+- Sessions are persisted by the engine (forking requires it) and named
+  `cxplr: <repo> › …`. Each map shows its session id; `codex resume <id>` or
+  `claude --resume <id>` (from the repository directory) continues it interactively.
+  With Claude Code, cxplr picks each session's id and creates a fork on its first turn
+  (`--resume <parent> --fork-session --session-id <id>`).
+- `--forget-sessions` deletes every session of the selected engine that cxplr created
+  for the project; cached maps stay, and later work starts new sessions.
 
 ## Cache
 
@@ -329,11 +356,11 @@ checkouts.
 | `maps/<key>.json` | One map per key |
 | `scopes/<hash>.json` | Latest map of a scope: its paths, file manifest and session |
 | `traces/<key>.json` | Example inputs per map content and flow |
-| `sessions.json` | Codex sessions cxplr created (for `--forget-sessions`) |
+| `sessions.json`, `sessions-claude.json` | Codex / Claude Code sessions cxplr created (for `--forget-sessions`) |
 | `atlas/` | The Markdown atlas |
 
 A map's key is its scope plus the content of every file it covers (git blob hashes of
-the working tree), the prompt version and the model. So:
+the working tree), the prompt version, the engine and the model. So:
 
 - a component keeps its map across commits, branches and uncommitted edits that do not
   touch its files; committing changes you already had uncommitted invalidates nothing;
@@ -352,6 +379,11 @@ Delete `.cxplr/` to start over.
   browser/computer tools disabled. They can still run read-only commands, including
   scripts in the target repository. A trusted project's `.codex` configuration still
   applies.
+- Claude Code sessions run with `--restricted` and only the `Read`, `Grep` and `Glob`
+  tools (`--permission-mode dontAsk`, no permission prompts): they cannot run commands,
+  use MCP servers or load hooks and other settings from `~/.claude` or the repository's
+  `.claude/`. Managed (enterprise) settings still apply, and the repository's
+  `CLAUDE.md` is read as context.
 - The web server listens on loopback by default; the source endpoint only serves paths
   that resolve inside the repository, and symlinks leading outside are refused.
 
@@ -369,14 +401,16 @@ cxplr [REPO] [OPTIONS]
 | `--port N` | 7878 | Web UI port |
 | `--host ADDR` | 127.0.0.1 | Address to listen on; keep it on loopback |
 | `--open` | | Open the browser once serving (always after `--index`) |
-| `--model NAME` | Codex config | Codex model |
+| `--engine codex\|claude` | `codex` | Agent that explores (see [Engines](#engines)) |
+| `--model NAME` | engine config | Model; Claude Code also takes aliases (`sonnet`, `opus`) |
 | `--codex PATH` | `codex` | Codex executable (run as `codex app-server`) |
+| `--claude PATH` | `claude` | Claude Code executable (run as `claude -p`) |
 | `--timeout-mins N` | 20 | Limit for one exploration, question or example run |
 | `--cache-dir DIR` | `REPO/.cxplr` | Cache location |
 | `--lsp LANG=COMMAND` | auto | Language server per language (`rust`, `python`, `typescript`, `go`, `c`, `scala`); empty command disables |
 | `--no-lsp` | | Disable language servers; navigation uses text search |
 | `--lsp-import-build` | | Let Metals import the Scala build for full navigation (runs the build tool) |
-| `--forget-sessions` | | Delete the Codex sessions cxplr created for `REPO` and exit |
-| `--install-skill` | | Install the cxplr skill for Codex and exit |
+| `--forget-sessions` | | Delete the selected engine's sessions cxplr created for `REPO` and exit |
+| `--install-skill` | | Install the cxplr skill for the selected engine and exit |
 | `--update` | | Install the latest release now (installer installs) and exit |
 | `--no-update` | | Skip the check for a newer release (also `CXPLR_NO_UPDATE=1`) |

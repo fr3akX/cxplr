@@ -1,12 +1,9 @@
 //! Client for `codex app-server` (JSON-RPC over stdio, one message per line).
 //!
-//! cxplr keeps a tree of persisted Codex sessions ("threads") that mirrors the map
-//! hierarchy: a component is explored in a fork of its parent's session, and
-//! questions fork the session of the map being viewed, so every turn starts with
-//! what its ancestors already read. Sessions are read-only, never ask for approval
+//! Sessions are persisted Codex threads, read-only, that never ask for approval
 //! and are named `cxplr: …` in the Codex session list.
 
-use serde::de::DeserializeOwned;
+use crate::engine::{one_line, Outcome, SESSION_GONE};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,14 +33,6 @@ pub struct CodexConfig {
     pub model: Option<String>,
     /// Limit for one turn.
     pub timeout: Duration,
-}
-
-pub struct Outcome<T> {
-    pub answer: T,
-    pub commands: u32,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>;
@@ -270,24 +259,28 @@ impl Codex {
         }
         let mut params = self.session_params();
         params["threadId"] = json!(thread);
-        self.request("thread/resume", params).await?;
+        self.request("thread/resume", params).await.map_err(|e| format!("{SESSION_GONE}: {e}"))?;
         self.loaded.lock().unwrap().insert(thread.to_owned());
         Ok(())
     }
 
+    /// Delete a session; one Codex no longer has counts as deleted.
     pub async fn delete_thread(&self, thread: &str) -> Result<(), String> {
-        self.request("thread/delete", json!({ "threadId": thread })).await.map(|_| ())
+        match self.request("thread/delete", json!({ "threadId": thread })).await {
+            Err(e) if e.contains("no rollout") || e.contains("not found") => Ok(()),
+            result => result.map(|_| ()),
+        }
     }
 
-    /// Run one turn in `thread` whose final answer must match `schema`.
-    pub async fn turn<T: DeserializeOwned>(
+    /// Run one turn in `thread`; the answer is the final message, as JSON.
+    pub async fn turn(
         &self,
         thread: &str,
         prompt: &str,
         schema: &Value,
         cancel: &Notify,
         mut progress: impl FnMut(String),
-    ) -> Result<Outcome<T>, String> {
+    ) -> Result<Outcome<Value>, String> {
         self.ensure_loaded(thread).await?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         {
@@ -336,7 +329,7 @@ impl Codex {
             state.last_error.clone().map_or("codex finished the turn without an answer".into(), |e| format!("codex finished without an answer: {e}"))
         })?;
         let answer = serde_json::from_str(text.trim())
-            .map_err(|e| format!("codex answer does not match the schema ({e}): {}", one_line(&text, 400)))?;
+            .map_err(|e| format!("codex answer is not JSON ({e}): {}", one_line(&text, 400)))?;
         Ok(Outcome {
             answer,
             commands: state.commands,
@@ -445,12 +438,4 @@ fn unwrap_shell(command: &str) -> String {
         }
     }
     word
-}
-
-fn one_line(text: &str, max: usize) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    match flat.char_indices().nth(max) {
-        Some((cut, _)) => format!("{}…", &flat[..cut]),
-        None => flat,
-    }
 }

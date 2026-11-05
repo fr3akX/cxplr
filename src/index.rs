@@ -147,7 +147,7 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
         let joined = tokio::select! {
             joined = running.join_next() => joined,
             _ = tokio::signal::ctrl_c() => {
-                // Dropping the set aborts the tasks; their codex processes are killed.
+                // Dropping the set aborts the tasks and with them their engine turns.
                 return Err("interrupted; finished maps are cached, re-run to continue".into());
             }
         };

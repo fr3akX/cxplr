@@ -2,17 +2,18 @@
 //! in git).
 //!
 //! - `maps/<key>.json`: one map. The key covers the cache format, prompt version,
-//!   model, scope and the content of every file under the paths the map describes,
-//!   so a component keeps its map as long as its own files are unchanged, however
-//!   they are committed.
+//!   engine, model, scope and the content of every file under the paths the map
+//!   describes, so a component keeps its map as long as its own files are unchanged,
+//!   however they are committed.
 //! - `scopes/<scope hash>.json`: the latest map of a scope, its paths and the file
 //!   manifest it was built from. When the files change, the latest map is still
 //!   served, marked stale with exactly which files changed, until it is refreshed.
 //! - `traces/<key>.json`: example inputs for one flow, keyed by the scope's content
 //!   key and the flow name.
-//! - `sessions.json`: every Codex session cxplr created (id → name), so they can be
-//!   deleted with `--forget-sessions`.
+//! - `sessions.json` (Codex) / `sessions-claude.json` (Claude Code): every session
+//!   cxplr created (id → name), so they can be deleted with `--forget-sessions`.
 
+use crate::engine::Kind;
 use crate::map::Map;
 use crate::prompt;
 use crate::repo::{self, Manifest, Repo};
@@ -33,9 +34,13 @@ struct Binding {
     key: String,
     commit: Option<String>,
     manifest: Manifest,
-    /// Codex session that produced the map; deeper maps and questions fork it.
+    /// Session that produced the map; deeper maps and questions fork it.
     #[serde(default)]
     session: Option<String>,
+    /// Engine the session belongs to; `None` in caches written before Claude Code
+    /// support, which only had Codex.
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -53,8 +58,9 @@ pub struct Cached {
 
 pub struct Cache {
     dir: PathBuf,
+    engine: &'static str,
     salt: String,
-    /// Serializes read-modify-write of `sessions.json` across concurrent jobs.
+    /// Serializes read-modify-write of the session registry across concurrent jobs.
     sessions_lock: Mutex<()>,
     /// One atlas rebuild at a time.
     atlas_lock: Mutex<()>,
@@ -71,7 +77,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 impl Cache {
-    pub fn open(dir: PathBuf, model: Option<&str>) -> io::Result<Cache> {
+    pub fn open(dir: PathBuf, engine: Kind, model: Option<&str>) -> io::Result<Cache> {
         fs::create_dir_all(dir.join("maps"))?;
         fs::create_dir_all(dir.join("scopes"))?;
         fs::create_dir_all(dir.join("traces"))?;
@@ -79,8 +85,13 @@ impl Cache {
         if !ignore.exists() {
             fs::write(ignore, "# cxplr cache: local only\n*\n")?;
         }
-        let salt = format!("{FORMAT}|prompt {}|model {}", prompt::VERSION, model.unwrap_or("default"));
-        Ok(Cache { dir, salt, sessions_lock: Mutex::new(()), atlas_lock: Mutex::new(()) })
+        // Codex keys predate engines and stay as they were, so existing caches stay fresh.
+        let engine_part = match engine {
+            Kind::Codex => String::new(),
+            other => format!("|engine {}", other.id()),
+        };
+        let salt = format!("{FORMAT}|prompt {}{engine_part}|model {}", prompt::VERSION, model.unwrap_or("default"));
+        Ok(Cache { dir, engine: engine.id(), salt, sessions_lock: Mutex::new(()), atlas_lock: Mutex::new(()) })
     }
 
     pub fn dir(&self) -> &Path {
@@ -144,20 +155,32 @@ impl Cache {
     ) -> io::Result<()> {
         let key = self.key(scope, &manifest);
         write_atomic(&self.map_file(&key), &serde_json::to_vec(map)?)?;
-        let binding = Binding { scope: scope.to_owned(), paths: paths.to_vec(), key, commit, manifest, session };
+        let binding = Binding {
+            scope: scope.to_owned(),
+            paths: paths.to_vec(),
+            key,
+            commit,
+            manifest,
+            session,
+            engine: Some(self.engine.to_owned()),
+        };
         write_atomic(&self.binding_file(scope), &serde_json::to_vec(&binding)?)
     }
 
-    /// The Codex session behind the scope's latest map.
+    /// The session behind the scope's latest map, if this engine made it.
     pub fn session(&self, scope: &str) -> Option<String> {
-        self.binding(scope)?.session
+        let binding = self.binding(scope)?;
+        (binding.engine.as_deref().unwrap_or("codex") == self.engine).then_some(binding.session).flatten()
     }
 
     fn sessions_file(&self) -> PathBuf {
-        self.dir.join("sessions.json")
+        match self.engine {
+            "codex" => self.dir.join("sessions.json"),
+            other => self.dir.join(format!("sessions-{other}.json")),
+        }
     }
 
-    /// Every Codex session cxplr created for this project (id → name).
+    /// Every session of this engine cxplr created for this project (id → name).
     pub fn sessions(&self) -> BTreeMap<String, String> {
         fs::read(self.sessions_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
@@ -227,7 +250,7 @@ mod tests {
         fs::write(dir.join("a/x.txt"), "one\n").unwrap();
         fs::write(dir.join("b/y.txt"), "two\n").unwrap();
         let repo = Repo::open(&dir).unwrap();
-        let cache = Cache::open(dir.join(".cxplr"), None).unwrap();
+        let cache = Cache::open(dir.join(".cxplr"), Kind::Codex, None).unwrap();
         assert_eq!(fs::read_to_string(dir.join(".cxplr/.gitignore")).unwrap().lines().last(), Some("*"));
 
         let a = vec!["a".to_owned()];
@@ -252,8 +275,15 @@ mod tests {
         assert_eq!(cache.state(&repo, "b"), Some("fresh"));
 
         // The same scope at a different model is a different key.
-        let other = Cache::open(dir.join(".cxplr"), Some("another-model")).unwrap();
+        let other = Cache::open(dir.join(".cxplr"), Kind::Codex, Some("another-model")).unwrap();
         assert_eq!(other.state(&repo, "a"), Some("stale"));
+
+        // Another engine has its own keys and never gets a Codex session to fork.
+        let claude = Cache::open(dir.join(".cxplr"), Kind::Claude, None).unwrap();
+        assert_eq!(claude.state(&repo, "a"), Some("stale"));
+        assert_eq!(claude.session("a"), None);
+        cache.record_session("session-a", "A").unwrap();
+        assert!(claude.sessions().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

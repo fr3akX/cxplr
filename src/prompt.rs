@@ -10,9 +10,9 @@ pub const VERSION: &str = "1";
 
 const RULES: &str = "\
 You are mapping a software repository so a developer can learn it top-down. The repository \
-root is the current working directory. Explore it with read-only shell commands (ls, rg, \
-sed -n, nl -ba, cat, git log). Do not modify files, install packages, or run the project's \
-code, builds or tests.
+root is the current working directory. Explore it read-only (shell commands such as ls, rg, \
+sed -n, nl -ba and git log, or file read and search tools). Do not modify files, install \
+packages, or run the project's code, builds or tests.
 
 When done, answer ONLY with the JSON object required by the output schema.
 
@@ -30,7 +30,8 @@ external systems and actors.
 step should correspond to an edge.
 - evidence: repository-relative path and 1-based line number of a line you actually read \
 that shows the claim (definition, call site, route, config entry). Take line numbers from \
-`nl -ba` or `rg -n` output; never estimate them. Prefer 1-3 strong citations per node or edge.
+tool output that shows them (`nl -ba`, `rg -n`, numbered file reads); never estimate them. \
+Prefer 1-3 strong citations per node or edge.
 - explorable: true when the node has enough internal structure for a deeper map (several \
 files, modules or classes); false for small single files, external systems and actors.
 - When something is inferred rather than seen in code or config, write \"(inferred)\" in \

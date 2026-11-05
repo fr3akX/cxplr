@@ -27,6 +27,11 @@ function esc(text) {
   return String(text ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
+/** The agent that explores, as named in the UI. */
+function engineName() {
+  return state.repo?.engine === 'claude' ? 'Claude Code' : 'Codex';
+}
+
 /** Minimal inline formatting: `code`, **bold**, paragraphs. Input is escaped first. */
 function md(text) {
   return String(text ?? '')
@@ -129,7 +134,7 @@ function showMissing(scope) {
   const parent = scope.includes('/') ? scope.slice(0, scope.lastIndexOf('/')) : '';
   showScreen(`
     <h2>${scope ? 'This component has no map yet' : 'This project has no map yet'}</h2>
-    <p class="muted">Exploring runs Codex in a read-only sandbox, typically a few minutes.
+    <p class="muted">Exploring runs ${esc(engineName())} read-only, typically a few minutes.
       To map the whole project up front, run <code>cxplr ${esc(state.repo?.root || '.')} --index</code>.</p>
     <div class="row">
       <button class="primary" id="explore-now" type="button">Explore now</button>
@@ -163,10 +168,10 @@ function watch(jobId, scope) {
   const label = renderCrumbsText();
   showScreen(`
     <div class="row"><div class="spinner"></div><h2>Exploring ${esc(label)}</h2></div>
-    <div class="muted">Codex is reading the repository in a read-only sandbox. <span id="elapsed"></span></div>
+    <div class="muted">${esc(engineName())} is reading the repository (read-only). <span id="elapsed"></span></div>
     <pre class="log" id="log"></pre>
     <div class="row"><button id="cancel" type="button">Cancel</button></div>`);
-  renderPanelNote('Exploration in progress. The map appears here when Codex finishes and its citations are verified.');
+  renderPanelNote(`Exploration in progress. The map appears here when ${engineName()} finishes and its citations are verified.`);
   $('#cancel').onclick = () => post(`/api/job/${jobId}/cancel`).catch((err) => showError(err.message, scope));
   let since = 0;
   const log = $('#log');
@@ -776,7 +781,7 @@ function renderPanelContent() {
       ${meta?.commit ? `Commit <code>${esc(meta.commit.slice(0, 10))}</code>${meta.dirty ? ' <span class="warn">(uncommitted changes)</span>' : ''} · ` : ''}
       ${meta ? `${new Date(meta.generated_at * 1000).toLocaleString()} · ${meta.refreshed ? 'refreshed in ' : ''}${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in${meta.cached_input_tokens ? ` (${fmtTokens(meta.cached_input_tokens)} cached)` : ''} / ${fmtTokens(meta.output_tokens)} out tokens` : ''}
       ${meta?.model ? ` · ${esc(meta.model)}` : ''}
-      ${meta?.session ? ` · session <code title="Continue it in a terminal: codex resume ${esc(meta.session)}">${esc(meta.session.slice(0, 8))}</code>` : ''}
+      ${meta?.session ? ` · session <code title="Continue it in a terminal: ${meta.engine === 'claude' ? 'claude --resume' : 'codex resume'} ${esc(meta.session)}">${esc(meta.session.slice(0, 8))}</code>` : ''}
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>
@@ -1075,17 +1080,17 @@ function renderTraceBox(t) {
     box.innerHTML = `${t.error ? `<p class="error-text">${esc(t.error)}</p>` : ''}
       <p class="meta">Concrete inputs that take different branches through this flow, with the data at every hop and the code that decides it.</p>
       <div class="actions"><button type="button" data-trace-gen>Generate example inputs</button></div>
-      <p class="meta">Runs Codex in a read-only sandbox (about 1–3 minutes); the result is cached with the map.</p>`;
+      <p class="meta">Runs ${esc(engineName())} read-only (about 1–3 minutes); the result is cached with the map.</p>`;
     return;
   }
   if (t.status === 'running') {
-    box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>Codex is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
+    box.innerHTML = `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName())} is tracing inputs… ${fmtDuration(t.elapsed || 0)}</span>
       <button type="button" data-trace-cancel>Cancel</button></div>${t.last ? `<div class="last">${esc(t.last)}</div>` : ''}</div>`;
     return;
   }
   const { scenarios, meta, diagnostics } = t.traces;
   if (!scenarios.length) {
-    box.innerHTML = '<p class="muted">Codex returned no scenario on this map.</p><div class="actions"><button type="button" data-trace-gen>Try again</button></div>';
+    box.innerHTML = `<p class="muted">${esc(engineName())} returned no scenario on this map.</p><div class="actions"><button type="button" data-trace-gen>Try again</button></div>`;
     return;
   }
   box.innerHTML = `<div class="actions" style="margin-top:0"><button type="button" class="primary" data-trace-play>▶ Play ${scenarios.length} examples</button>
@@ -1963,7 +1968,7 @@ function focusFind() {
 
 /**
  * A conversation is the Ask tab's, or a thread under selected code lines. Each
- * keeps its own Codex session: the first question forks the current map's
+ * keeps its own agent session: the first question forks the current map's
  * session, follow-ups continue it.
  */
 function conversation(id, extra) {
@@ -2136,7 +2141,7 @@ function askContext() {
   const crumbs = state.map?.meta?.crumbs?.join(' › ') || state.repo?.name || 'repository';
   chips.push(`<span class="chip">Map <b>${esc(crumbs)}</b></span>`);
   chips.push(mainConv.session
-    ? `<span class="chip" title="Follow-ups continue Codex session ${esc(mainConv.session)}">Conversation <b>continues</b><button type="button" data-new-conv title="Start a new conversation from the current map's session">✕</button></span>`
+    ? `<span class="chip" title="Follow-ups continue ${esc(engineName())} session ${esc(mainConv.session)}">Conversation <b>continues</b><button type="button" data-new-conv title="Start a new conversation from the current map's session">✕</button></span>`
     : '<span class="chip" title="The first question forks the session that explored this map">Conversation <b>new</b></span>');
   const node = state.selected?.type === 'node' ? nodeById(state.selected.id) : null;
   if (node) {
@@ -2157,7 +2162,7 @@ $('#ask-context').addEventListener('click', (e) => {
 function renderEntry(entry, convId) {
   const q = `<div class="msg-q">${esc(entry.question)}</div><div class="msg-ctx">${esc(entry.label)}</div>`;
   if (entry.status === 'running') {
-    return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>Codex is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
+    return q + `<div class="msg-a"><div class="status"><div class="spinner"></div><span>${esc(engineName())} is investigating… ${fmtDuration(entry.elapsed || 0)}</span>
       <button type="button" data-cancel="${entry.job}">Cancel</button></div>${entry.last ? `<div class="last">${esc(entry.last)}</div>` : ''}</div>`;
   }
   if (entry.status !== 'done') {
@@ -2300,6 +2305,7 @@ window.addEventListener('keydown', (e) => {
     state.repo = await api('/api/repo');
     $('#repo').textContent = `${state.repo.root}${state.repo.commit ? ` @ ${state.repo.commit.slice(0, 10)}` : ''}`;
     $('#repo').title = $('#repo').textContent;
+    document.querySelectorAll('[data-engine-name]').forEach((el) => { el.textContent = engineName(); });
   } catch (err) {
     return showError(err.message, '');
   }

@@ -78,9 +78,13 @@ pub struct Meta {
     /// Input tokens served from the provider's cache (shared session context).
     #[serde(default)]
     pub cached_input_tokens: u64,
-    /// Codex session the map was made in (`codex resume <id>` continues it).
+    /// Session the map was made in (`codex resume <id>` or `claude --resume <id>`
+    /// continues it, depending on `engine`).
     #[serde(default)]
     pub session: Option<String>,
+    /// `codex` or `claude`; absent in maps made before Claude Code support (Codex).
+    #[serde(default)]
+    pub engine: Option<String>,
     /// Refreshed in its existing session rather than explored from scratch.
     #[serde(default)]
     pub refreshed: bool,
