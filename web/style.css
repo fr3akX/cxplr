@@ -181,9 +181,17 @@ pre.payload { background: var(--code-bg); border-radius: 5px; padding: 4px 8px; 
 .sc-walk .error-text { display: block; margin-top: 4px; }
 #modal.walking { background: transparent; justify-content: flex-end; pointer-events: none; }
 #modal.walking .modal-box {
-  pointer-events: auto; width: min(1100px, 62vw); height: calc(100vh - 24px); margin-right: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, .25);
+  pointer-events: auto; width: var(--walk-w, min(1100px, 62vw)); height: calc(100vh - 24px); margin-right: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, .25); position: relative;
 }
+#walk-resize { display: none; }
+#modal.walking #walk-resize {
+  display: block; position: absolute; left: -5px; top: 0; bottom: 0; width: 10px; cursor: col-resize; z-index: 3;
+}
+#modal.walking #walk-resize:hover { background: linear-gradient(90deg, transparent 4px, var(--accent) 4px, var(--accent) 6px, transparent 6px); }
+#walk-bar [data-walk-play].active { border-color: var(--accent); color: var(--accent); }
+#walk-bar select { font-size: 12px; padding: 1px 4px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--fg); }
+#walk-bar .wb-follow { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
 #walk-bar {
   display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border);
   background: var(--accent-soft); font-size: 13px; min-width: 0;

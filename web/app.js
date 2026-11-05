@@ -461,6 +461,7 @@ function showMap(map) {
   fit();
   renderPanel();
   if (state.pendingSim) playPendingSim();
+  if (walker) walkMapChanged();
 }
 
 function renderGraph() {
@@ -623,9 +624,12 @@ function fit() {
   const box = $('#viewport').getBBox();
   const r = svg.getBoundingClientRect();
   if (!box.width || !r.width) return;
+  // While a walkthrough docks the viewer over the map, fit into the part left uncovered.
+  const dock = walker && !$('#modal').hidden ? $('.modal-box').getBoundingClientRect().left : r.right;
+  const width = Math.max(160, Math.min(r.right, dock) - r.left);
   const pad = 48;
-  const k = Math.min((r.width - 2 * pad) / box.width, (r.height - 2 * pad) / box.height, 1.25);
-  state.view = { k, x: (r.width - box.width * k) / 2 - box.x * k, y: (r.height - box.height * k) / 2 - box.y * k };
+  const k = Math.min((width - 2 * pad) / box.width, (r.height - 2 * pad) / box.height, 1.25);
+  state.view = { k, x: (width - box.width * k) / 2 - box.x * k, y: (r.height - box.height * k) / 2 - box.y * k };
   applyView();
 }
 
@@ -1283,13 +1287,29 @@ function pollWalk(id, k, w) {
 
 function openWalk(walk) {
   if (!walk.steps.length) return;
-  walker = { walk, index: 0, node: null };
-  $('#modal').classList.add('walking');
+  if (walker) exitWalk();
+  walker = {
+    walk,
+    index: 0,
+    node: null,
+    scope: state.scope, // the map the walk belongs to; Follow never goes above it
+    scopePaths: new Map(), // component maps entered during the walk -> the paths they cover
+    cameFrom: null, // component left by stepping out: the token starts there on the parent map
+    movingSince: 0,
+    playing: false,
+    timer: 0,
+  };
+  const modal = $('#modal');
+  modal.classList.add('walking');
+  applyWalkWidth();
+  modal.hidden = false;
+  fit();
   showWalkStep(0);
 }
 
 function exitWalk() {
   if (!walker) return;
+  clearTimeout(walker.timer);
   walker = null;
   stopSim();
   clearWalkMarks();
@@ -1297,6 +1317,7 @@ function exitWalk() {
   renderWalkBar();
   applyHighlight();
   $('#modal').classList.remove('walking');
+  fit();
 }
 
 function clearWalkMarks() {
@@ -1304,8 +1325,9 @@ function clearWalkMarks() {
   document.querySelectorAll('#src-body .walk-card').forEach((el) => el.remove());
 }
 
-async function showWalkStep(i) {
+async function showWalkStep(i, { auto = false } = {}) {
   if (!walker) return;
+  if (!auto) pauseWalk();
   const { steps } = walker.walk;
   const index = Math.max(0, Math.min(steps.length - 1, i));
   walker.index = index;
@@ -1314,8 +1336,10 @@ async function showWalkStep(i) {
   markWalkNode({ animate: true });
   applyHighlight();
   renderWalkBar();
+  syncWalkScope();
   if (!step.verified) {
     $('#modal').hidden = false;
+    scheduleWalkNext();
     return;
   }
   await openSource(step.path, step.line);
@@ -1329,7 +1353,159 @@ async function showWalkStep(i) {
   card.scrollIntoView({ block: 'nearest' });
   const first = lineEl(tab, step.line);
   if (first && first.getBoundingClientRect().top < $('#src-body').getBoundingClientRect().top) first.scrollIntoView({ block: 'start' });
+  scheduleWalkNext();
 }
+
+// Autoplay: one step per interval, waiting for the token and any map change to finish.
+
+const WALK_DELAYS = { slow: 6000, normal: 3500, fast: 1800 };
+
+function walkSpeed() {
+  const s = localStorage.getItem('cxplr:walk-speed');
+  return WALK_DELAYS[s] ? s : 'normal';
+}
+
+function walkFollow() {
+  return localStorage.getItem('cxplr:walk-follow') !== 'off';
+}
+
+/** A map change for the walk is still loading (give up waiting after a few seconds). */
+function walkMoving(w) {
+  return w.movingSince && performance.now() - w.movingSince < 5000;
+}
+
+function pauseWalk() {
+  if (!walker) return;
+  walker.playing = false;
+  clearTimeout(walker.timer);
+}
+
+function toggleWalkPlay() {
+  if (!walker) return;
+  if (walker.playing) {
+    pauseWalk();
+    return renderWalkBar();
+  }
+  walker.playing = true;
+  const atEnd = walker.index >= walker.walk.steps.length - 1;
+  showWalkStep(atEnd ? 0 : walker.index + 1, { auto: true });
+}
+
+function scheduleWalkNext() {
+  const w = walker;
+  if (!w?.playing) return;
+  clearTimeout(w.timer);
+  const tick = () => {
+    if (walker !== w || !w.playing) return;
+    if (sim.running || walkMoving(w)) {
+      w.timer = setTimeout(tick, 200);
+      return;
+    }
+    if (w.index >= w.walk.steps.length - 1) {
+      w.playing = false;
+      return renderWalkBar();
+    }
+    showWalkStep(w.index + 1, { auto: true });
+  };
+  w.timer = setTimeout(tick, WALK_DELAYS[walkSpeed()]);
+}
+
+// Following the walk across map levels.
+
+/**
+ * Show the map level the current step's file belongs to: step out of a component map
+ * the file is not in (never above the walk's own map) and, with Follow on, into the
+ * map of the component the file is in, once the token has arrived.
+ */
+function syncWalkScope() {
+  const w = walker;
+  if (!w || walkMoving(w)) return;
+  const step = w.walk.steps[w.index];
+  if (!step.verified) return;
+  const here = w.scopePaths.get(state.scope);
+  if (here && !here.some((p) => pathMatch(p, step.path) >= 0)) return leaveWalkScope();
+  if (!walkFollow()) return;
+  const node = w.node && nodeById(w.node);
+  if (node && hasChildMap(node.id) && node.paths.some((p) => pathMatch(p, step.path) > 0)) enterWalkScope(node.id, { afterToken: true });
+}
+
+function hasChildMap(id) {
+  return ['fresh', 'stale'].includes(state.children?.[id]);
+}
+
+/** True when the shown map is below the walk's own map. */
+function walkIsDeeper() {
+  const base = walker.scope;
+  return base ? state.scope.startsWith(`${base}/`) : state.scope !== '';
+}
+
+function enterWalkScope(id, { afterToken = false } = {}) {
+  const w = walker;
+  const node = nodeById(id);
+  if (!node || !hasChildMap(id)) return;
+  const target = childScope(id);
+  w.scopePaths.set(target, node.paths);
+  w.movingSince = performance.now();
+  const t0 = performance.now();
+  const goWhenArrived = () => {
+    if (walker !== w) return;
+    if (afterToken && sim.running && performance.now() - t0 < 3000) return setTimeout(goWhenArrived, 100);
+    w.cameFrom = null;
+    go(target);
+  };
+  goWhenArrived();
+}
+
+function leaveWalkScope() {
+  const w = walker;
+  if (!walkIsDeeper()) return;
+  const cut = state.scope.lastIndexOf('/');
+  w.cameFrom = state.scope.slice(cut + 1);
+  w.movingSince = performance.now();
+  go(cut < 0 ? '' : state.scope.slice(0, cut));
+}
+
+/** A new map is shown during the walk: re-fit, light the step's component there, follow on. */
+function walkMapChanged() {
+  const w = walker;
+  w.movingSince = 0;
+  // Stepping out: the token starts at the component that was left.
+  w.node = w.cameFrom && state.layout.at[w.cameFrom] ? w.cameFrom : null;
+  w.cameFrom = null;
+  fit();
+  markWalkNode({ animate: true });
+  applyHighlight();
+  renderWalkBar();
+  syncWalkScope();
+}
+
+// Docked viewer width, adjustable by dragging its left edge.
+
+function applyWalkWidth() {
+  const saved = Number(localStorage.getItem('cxplr:walk-width'));
+  $('#modal').style.setProperty('--walk-w', saved ? `${Math.max(420, Math.min(saved, window.innerWidth - 240))}px` : '');
+}
+
+$('#walk-resize').addEventListener('pointerdown', (e) => {
+  if (!walker) return;
+  e.preventDefault();
+  const handle = e.currentTarget;
+  handle.setPointerCapture(e.pointerId);
+  const move = (ev) => {
+    const width = Math.max(420, Math.min(window.innerWidth - 240, window.innerWidth - ev.clientX - 12));
+    $('#modal').style.setProperty('--walk-w', `${width}px`);
+    localStorage.setItem('cxplr:walk-width', String(Math.round(width)));
+  };
+  const up = () => {
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', up);
+    fit();
+    const el = walker?.node && document.querySelector(`#nodes .node[data-node="${CSS.escape(walker.node)}"]`);
+    if (el) keepNodeVisible(el);
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', up);
+});
 
 function walkCardHtml(step, index, total) {
   return `<div class="wc-head"><span class="wc-kind wc-${esc(step.kind)}">${esc(step.kind)}</span><b>${esc(step.title)}</b>
@@ -1348,39 +1524,68 @@ function renderWalkBar() {
     bar.innerHTML = '';
     return;
   }
-  const { walk, index } = walker;
+  const { walk, index, playing } = walker;
   const step = walk.steps[index];
   const meta = walk.meta || {};
   const node = walker.node && nodeById(walker.node);
+  const speed = walkSpeed();
   bar.hidden = false;
   bar.innerHTML = `<button type="button" data-walk-prev ${index === 0 ? 'disabled' : ''} title="Previous step ([ or K)">◀</button>
     <span class="wb-count">${index + 1} / ${walk.steps.length}</span>
     <button type="button" data-walk-next ${index === walk.steps.length - 1 ? 'disabled' : ''} title="Next step (] or J)">▶</button>
+    <button type="button" data-walk-play class="${playing ? 'active' : ''}" title="${playing ? 'Pause' : 'Play the steps one after another'} (Space)">${playing ? '❚❚ Pause' : '⏵ Play'}</button>
+    <select id="walk-speed" title="Time per step while playing">${Object.keys(WALK_DELAYS).map((s) => `<option value="${s}" ${s === speed ? 'selected' : ''}>${s}</option>`).join('')}</select>
     <span class="wb-title"><b>${esc(meta.scenario || 'Walkthrough')}</b> <span class="muted">${esc(trunc(meta.input || '', 140))}</span></span>
     ${node ? `<span class="wb-node" title="The map component this code belongs to">${esc(node.name)}</span>` : ''}
+    ${walkIsDeeper() ? '<button type="button" data-walk-out title="Back to the enclosing map">‹ Out</button>' : ''}
+    ${node && hasChildMap(node.id) ? `<button type="button" data-walk-into title="Open ${esc(node.name)}'s own map and keep walking there">Into ${esc(trunc(node.name, 24))} ›</button>` : ''}
+    <label class="wb-follow" title="Open a component's own map when the walk enters it, and leave it when the walk does"><input type="checkbox" id="walk-follow" ${walkFollow() ? 'checked' : ''}> Follow</label>
     ${step.verified ? '' : `<span class="error-text" title="${esc(step.title)}">${esc(step.path)}:${step.line}: ${esc(step.problem || 'not verified')}</span>`}
     <button type="button" data-walk-exit title="Leave the walkthrough (Esc)">✕</button>`;
 }
 
-/** The node of the current map whose paths contain `path` most specifically. */
-function nodeForPath(path) {
+/** How specifically a node path contains `path`: its length, 0 for the whole repository, -1 if not. */
+function pathMatch(raw, path) {
+  const p = raw.replace(/^\.\//, '').replace(/\/+$/, '');
+  if (p === '' || p === '.') return 0;
+  return path === p || path.startsWith(`${p}/`) ? p.length : -1;
+}
+
+/**
+ * The node of the current map whose paths contain `path` most specifically. Nodes
+ * sharing the file (e.g. a module's constants and its function) are told apart by
+ * their citations in it: the one cited closest to `line` wins, preferring citations
+ * at or above it (where the enclosing definition starts).
+ */
+function nodeForPath(path, line = 0) {
   let best = null;
   let bestLen = -1;
+  let bestGap = Infinity;
   for (const n of state.map?.nodes || []) {
-    for (const raw of n.paths) {
-      const p = raw.replace(/^\.\//, '').replace(/\/+$/, '');
-      const len = p === '' || p === '.' ? 0 : path === p || path.startsWith(`${p}/`) ? p.length : -1;
-      if (len > bestLen) { bestLen = len; best = n.id; }
+    const len = Math.max(-1, ...n.paths.map((raw) => pathMatch(raw, path)));
+    if (len < 0 || len < bestLen) continue;
+    let gap = Infinity;
+    for (const ev of n.evidence || []) {
+      if (ev.path === path && line) gap = Math.min(gap, ev.line <= line ? line - ev.line : 2 * (ev.line - line));
+    }
+    if (len > bestLen || gap < bestGap) {
+      best = n.id;
+      bestLen = len;
+      bestGap = gap;
     }
   }
   return best;
 }
 
+/** The component of a walkthrough step on the current map. */
+function stepNode(s) {
+  return s.verified ? nodeForPath(s.path, s.line) : null;
+}
+
 /** Component of step `i`: its file's component, or the last one before it. */
 function walkNodeAt(i) {
   for (let k = i; k >= 0; k--) {
-    const s = walker.walk.steps[k];
-    const id = s.verified ? nodeForPath(s.path) : null;
+    const id = stepNode(walker.walk.steps[k]);
     if (id) return id;
   }
   return null;
@@ -1391,7 +1596,7 @@ function walkHops() {
   const hops = [];
   let prev = null;
   walker.walk.steps.forEach((s, index) => {
-    const id = s.verified ? nodeForPath(s.path) : null;
+    const id = stepNode(s);
     if (!id) return;
     if (prev && id !== prev) hops.push({ index, from: prev, to: id });
     prev = id;
@@ -1425,7 +1630,7 @@ function markWalkNode({ animate = false } = {}) {
 /** Map highlight while walking: arrows walked so far numbered by step, the rest dimmed. */
 function applyWalkHighlight(nodes, edges, hiEdge, overlay) {
   const { map } = state;
-  const onWalk = new Set(walker.walk.steps.map((s) => (s.verified ? nodeForPath(s.path) : null)).filter(Boolean));
+  const onWalk = new Set(walker.walk.steps.map(stepNode).filter(Boolean));
   const walked = new Set();
   const upcoming = new Set();
   const badges = new Map();
@@ -1479,6 +1684,21 @@ $('#modal').addEventListener('click', (e) => {
   if (e.target.closest('[data-walk-prev]')) return showWalkStep(walker.index - 1);
   if (e.target.closest('[data-walk-next]')) return showWalkStep(walker.index + 1);
   if (e.target.closest('[data-walk-exit]')) return exitWalk();
+  if (e.target.closest('[data-walk-play]')) return toggleWalkPlay();
+  if (e.target.closest('[data-walk-into]')) return walker.node && enterWalkScope(walker.node);
+  if (e.target.closest('[data-walk-out]')) return leaveWalkScope();
+});
+
+$('#modal').addEventListener('change', (e) => {
+  if (!walker) return;
+  if (e.target.id === 'walk-follow') {
+    localStorage.setItem('cxplr:walk-follow', e.target.checked ? 'on' : 'off');
+    syncWalkScope();
+  }
+  if (e.target.id === 'walk-speed') {
+    localStorage.setItem('cxplr:walk-speed', e.target.value);
+    scheduleWalkNext();
+  }
 });
 
 // ---------- highlighting ----------
@@ -2588,6 +2808,7 @@ window.addEventListener('keydown', (e) => {
   if (walker && modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !e.target.closest('input, textarea')) {
     if (e.key === ']' || e.key === 'j' || e.key === 'J') { e.preventDefault(); return showWalkStep(walker.index + 1); }
     if (e.key === '[' || e.key === 'k' || e.key === 'K') { e.preventDefault(); return showWalkStep(walker.index - 1); }
+    if (e.key === ' ') { e.preventDefault(); return toggleWalkPlay(); }
   }
   if (e.key === 'Escape') {
     if (modalOpen && !$('#sym').hidden) { $('#sym').hidden = true; return; }

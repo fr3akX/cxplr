@@ -10,8 +10,9 @@ cited source lines, in a local web UI.
   content-addressed cache that survives commits.
 - **Simulation**: watch N inputs travel a data flow; generate concrete example inputs
   that take different branches, with the data at every step.
-- **Code walkthrough**: step forward and back through the code one example input runs,
-  with notes and values at each step and its component lit up on the map.
+- **Code walkthrough**: step forward and back (or autoplay) through the code one example
+  input runs, with notes and values at each step, while the map follows along: tokens
+  between components, and into a component's own map and back out.
 - **Source viewer** with tabs that keep their place, a functions/classes outline, find
   in file and across the repository, syntax highlighting and code navigation through
   language servers (Rust, Python, TS/JS, Go, C/C++, Scala), with text-search fallback.
@@ -128,7 +129,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.8.0 is available (you have 0.7.0): run `cxplr --update`
+cxplr 0.9.0 is available (you have 0.8.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -143,8 +144,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.8.0"
-git tag v0.8.0 && git push origin main v0.8.0
+cargo build && git commit -am "Release 0.9.0"
+git tag v0.9.0 && git push origin main v0.9.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -243,15 +244,23 @@ Step through the code one example input actually runs, like a debugger you move 
    there, which way a branch goes and why, and the concrete values at that point. Every
    range is checked against the files; the result is cached, and the button then reads
    **Step through code · N steps**.
-2. The source viewer docks to the right so the map stays visible. Each step opens its
-   file in a tab, highlights its lines and shows a note under them. On the map, the
-   component whose paths contain the file is lit (the bar shows its name); a step into
-   another component sends a numbered token along the arrow between them (backwards
-   when stepping back), arrows walked so far stay highlighted with their step numbers,
-   and components the walk never visits are dimmed. The component is worked out from
-   the file path, so this also works after zooming into a component's own map.
-3. **▶ / ◀** in the bar or the note, or `]` / `[` (`J` / `K`), move forward and back.
-   `Esc` leaves the walkthrough and keeps the viewer open.
+2. The source viewer docks to the right so the map stays visible; drag its left edge to
+   resize it (the width is remembered) and the map fits into the space left. Each step
+   opens its file in a tab, highlights its lines and shows a note under them. On the
+   map, the component whose paths contain the file is lit (the bar shows its name); a
+   step into another component sends a numbered token along the arrow between them
+   (backwards when stepping back), arrows walked so far stay highlighted with their step
+   numbers, and components the walk never visits are dimmed.
+3. **Across map levels.** With **Follow** on (the default), when the walk enters a
+   component that has its own map, the map opens it once the token arrives and the walk
+   continues on its sub-components; when the walk leaves that component, the map steps
+   back out and the token starts from the component it left. **Into ‹component› ›** and
+   **‹ Out** do the same by hand (with Follow off, the walk still steps out when the code
+   leaves a map it entered). The walk never goes above the map it started on.
+4. **▶ / ◀** in the bar or the note, or `]` / `[` (`J` / `K`), move forward and back.
+   **⏵ Play** (`Space`) steps on by itself, `slow`, `normal` or `fast`, waiting for each
+   token and map change; any manual step pauses it. `Esc` leaves the walkthrough and
+   keeps the viewer open.
 
 Walkthroughs are keyed by the content of the map's files, like example inputs: after
 the code changes, generate the example inputs and the walkthrough again.
