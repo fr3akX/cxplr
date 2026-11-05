@@ -82,8 +82,14 @@ impl Explorer {
     /// A new session that starts from `from`'s session when it has one (so it knows
     /// what that exploration read), otherwise a fresh session.
     pub async fn session_from(&self, from: Option<&str>, name: &str, progress: &mut impl FnMut(String)) -> Result<String, String> {
+        self.fork_or_start(&self.engine, from, name, progress).await
+    }
+
+    /// `session_from` on `engine`, which must be the indexing engine's kind and model
+    /// (it forks that engine's map sessions).
+    async fn fork_or_start(&self, engine: &Engine, from: Option<&str>, name: &str, progress: &mut impl FnMut(String)) -> Result<String, String> {
         if let Some(parent) = from.and_then(|s| self.cache.session(s)) {
-            match self.engine.fork(&parent, name).await {
+            match engine.fork(&parent, name).await {
                 Ok(id) => {
                     self.record(&id, name);
                     progress(format!("Continuing from session {parent} (forked as {id})"));
@@ -93,7 +99,7 @@ impl Explorer {
                 Err(e) => progress(format!("! cannot fork session {parent}: {e}; starting a new session")),
             }
         }
-        let id = self.engine.start_session(name).await?;
+        let id = engine.start_session(name).await?;
         self.record(&id, name);
         progress(format!("New session {id}"));
         Ok(id)
@@ -109,15 +115,22 @@ impl Explorer {
         self.asker.as_ref().unwrap_or(&self.engine)
     }
 
+    /// The ask engine cannot fork map sessions: it is another engine, or another
+    /// model that would read that history cold. (Another effort alone keeps the
+    /// engine and model, so forking still carries over what the session read.)
+    pub fn ask_seeded(&self) -> bool {
+        self.asker.as_ref().is_some_and(|a| a.kind() != self.engine.kind() || a.model() != self.engine.model())
+    }
+
     /// A session for a question, example inputs or a walkthrough about `scope`, and
-    /// the context to put in front of its first prompt. The indexing engine forks the
-    /// scope's map session, which has already read that code. A separate ask engine or
-    /// model cannot use that session (another engine, or a model with a cold prompt
-    /// cache), so it starts a new one seeded with the atlas pages down to `scope`.
+    /// the context to put in front of its first prompt. Normally this forks the
+    /// scope's map session, which has already read that code. A seeded ask engine
+    /// (see `ask_seeded`) starts a new session with the atlas pages down to `scope`.
     pub async fn ask_session(&self, scope: &str, name: &str, progress: &mut impl FnMut(String)) -> Result<(String, Option<String>), String> {
-        let Some(asker) = &self.asker else {
-            return Ok((self.session_from(Some(scope), name, progress).await?, None));
-        };
+        let asker = self.ask_engine();
+        if !self.ask_seeded() {
+            return Ok((self.fork_or_start(asker, Some(scope), name, progress).await?, None));
+        }
         let id = asker.start_session(name).await?;
         let _ = self.cache.record_session(asker.kind(), &id, name);
         let context = atlas::context(&self.cache, scope);
@@ -196,6 +209,7 @@ impl Explorer {
             commit: commit.clone(),
             dirty: self.repo.is_dirty(),
             model: self.engine.model().map(str::to_owned),
+            effort: self.engine.effort().map(str::to_owned),
             duration_ms: started.elapsed().as_millis() as u64,
             commands: out.commands,
             input_tokens: out.input_tokens,

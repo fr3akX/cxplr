@@ -797,7 +797,7 @@ function renderPanelContent() {
     <p class="meta">
       ${meta?.commit ? `Commit <code>${esc(meta.commit.slice(0, 10))}</code>${meta.dirty ? ' <span class="warn">(uncommitted changes)</span>' : ''} · ` : ''}
       ${meta ? `${new Date(meta.generated_at * 1000).toLocaleString()} · ${meta.refreshed ? 'refreshed in ' : ''}${fmtDuration(meta.duration_ms)} · ${meta.commands} commands · ${fmtTokens(meta.input_tokens)} in${meta.cached_input_tokens ? ` (${fmtTokens(meta.cached_input_tokens)} cached)` : ''} / ${fmtTokens(meta.output_tokens)} out tokens` : ''}
-      ${meta?.model ? ` · ${esc(meta.model)}` : ''}
+      ${meta?.model ? ` · ${esc(meta.model)}` : ''}${meta?.effort ? ` · effort ${esc(meta.effort)}` : ''}
       ${meta?.session ? ` · session <code title="${esc(sessionHint(meta))}">${esc(meta.session.slice(0, 8))}</code>` : ''}
     </p>
     <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·

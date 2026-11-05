@@ -164,11 +164,32 @@ async fn setup(kind: Kind, cfg: &mut Config, model: Option<String>) -> Result<Op
     }
 }
 
-fn summary(kind: Kind, model: Option<&str>, cfg: &Config) -> String {
+/// The reasoning effort for `kind`; Enter keeps `current`, `-` returns to the default.
+fn effort(kind: Kind, current: Option<String>) -> Result<Option<String>, String> {
+    let (levels, default) = match kind {
+        Kind::Codex => ("a level your model offers, e.g. low, medium, high", "your Codex config"),
+        Kind::Claude => ("low, medium, high, xhigh or max", "Claude Code's default"),
+        Kind::Anthropic => ("low, medium, high, xhigh or max; current models always think, off works only before Claude 4.6", "the API's default"),
+        Kind::OpenAi => ("sent as reasoning_effort, e.g. none, low, medium, high; the server checks it", "the server's default"),
+    };
+    println!("  Reasoning effort: {levels}.");
+    loop {
+        let chosen = text("Reasoning effort", current.as_deref(), default)?;
+        match (&chosen, kind) {
+            (Some(e), Kind::Anthropic) if !["off", "none", "low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) => {
+                println!("  use low, medium, high, xhigh or max (off only on models before Claude 4.6)");
+            }
+            _ => return Ok(chosen),
+        }
+    }
+}
+
+fn summary(kind: Kind, model: Option<&str>, effort: Option<&str>, cfg: &Config) -> String {
     let model = model.map_or_else(|| "default model".to_owned(), |m| format!("model {m}"));
+    let effort = effort.map_or_else(|| "default effort".to_owned(), |e| format!("effort {e}"));
     match kind {
-        Kind::OpenAi => format!("{} ({model}) at {}", kind.id(), cfg.openai_base_url.as_deref().unwrap_or(openai::DEFAULT_BASE_URL)),
-        _ => format!("{} ({model})", kind.id()),
+        Kind::OpenAi => format!("{} ({model}, {effort}) at {}", kind.id(), cfg.openai_base_url.as_deref().unwrap_or(openai::DEFAULT_BASE_URL)),
+        _ => format!("{} ({model}, {effort})", kind.id()),
     }
 }
 
@@ -181,33 +202,43 @@ pub async fn run(current: Option<Config>) -> Result<Config, String> {
 
     let default_engine = cfg.engine.unwrap_or(if on_path("codex") || !on_path("claude") { Kind::Codex } else { Kind::Claude });
     let engine = pick_engine("Engine that makes the maps (indexing):", default_engine, &cfg)?;
-    let model = if cfg.engine.unwrap_or(Kind::Codex) == engine { cfg.model.clone() } else { None };
+    let own = cfg.engine.unwrap_or(Kind::Codex) == engine;
+    let model = if own { cfg.model.clone() } else { None };
     cfg.model = setup(engine, &mut cfg, model).await?;
+    cfg.effort = effort(engine, if own { cfg.effort.clone() } else { None })?;
     cfg.engine = Some(engine);
 
-    let separate = cfg.ask_engine.is_some() || cfg.ask_model.is_some();
+    let separate = cfg.ask_engine.is_some() || cfg.ask_model.is_some() || cfg.ask_effort.is_some();
     println!();
-    if confirm("Use another engine or model for questions, example inputs and walkthroughs?", separate)? {
+    if confirm("Use another engine, model or effort for questions, example inputs and walkthroughs?", separate)? {
         let ask = pick_engine("Engine for questions, example inputs and walkthroughs:", cfg.ask_engine.unwrap_or(engine), &cfg)?;
-        let model = if cfg.ask_engine.unwrap_or(engine) == ask { cfg.ask_model.clone() } else { None };
-        let model = setup(ask, &mut cfg, model).await?;
-        if ask == engine && model == cfg.model {
-            println!("  same engine and model as indexing: nothing separate to save");
+        let keep = cfg.ask_engine.unwrap_or(engine) == ask;
+        let current = if keep { cfg.ask_model.clone() } else { None };
+        let model = setup(ask, &mut cfg, current).await?;
+        let ask_effort = effort(ask, if keep { cfg.ask_effort.clone() } else { None })?;
+        let same = ask == engine;
+        if same && model.as_ref().is_none_or(|m| Some(m) == cfg.model.as_ref()) && ask_effort.as_ref().is_none_or(|e| Some(e) == cfg.effort.as_ref()) {
+            println!("  same engine, model and effort as indexing: nothing separate to save");
             cfg.ask_engine = None;
             cfg.ask_model = None;
+            cfg.ask_effort = None;
         } else {
-            cfg.ask_engine = (ask != engine).then_some(ask);
+            cfg.ask_engine = (!same).then_some(ask);
             cfg.ask_model = model;
+            cfg.ask_effort = ask_effort;
         }
     } else {
         cfg.ask_engine = None;
         cfg.ask_model = None;
+        cfg.ask_effort = None;
     }
 
-    println!("\nMaps:      {}", summary(engine, cfg.model.as_deref(), &cfg));
+    println!("\nMaps:      {}", summary(engine, cfg.model.as_deref(), cfg.effort.as_deref(), &cfg));
     let ask = cfg.ask_engine.unwrap_or(engine);
-    let ask_model = if cfg.ask_engine.is_some() || cfg.ask_model.is_some() { cfg.ask_model.as_deref() } else { cfg.model.as_deref() };
-    println!("Questions: {}", summary(ask, ask_model, &cfg));
+    // On the same engine, unset ask settings mean the indexing ones.
+    let inherit = |own: &Option<String>, index: &Option<String>| if cfg.ask_engine.is_none() { own.clone().or_else(|| index.clone()) } else { own.clone() };
+    let (ask_model, ask_effort) = (inherit(&cfg.ask_model, &cfg.model), inherit(&cfg.ask_effort, &cfg.effort));
+    println!("Questions: {}", summary(ask, ask_model.as_deref(), ask_effort.as_deref(), &cfg));
     if !confirm("Save?", true)? {
         return Err("configuration not saved".into());
     }

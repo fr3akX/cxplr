@@ -54,6 +54,12 @@ struct Args {
     /// native Anthropic claude-sonnet-5-5, openai $OPENAI_MODEL or the server's only model)
     #[arg(long)]
     model: Option<String>,
+    /// Reasoning effort for indexing (default: the configured effort, else the
+    /// engine's own). Codex: a level the model offers (e.g. low, medium, high);
+    /// claude: low, medium, high, xhigh, max; anthropic: off, low, medium, high,
+    /// xhigh, max (thinking budget); openai: sent as `reasoning_effort`
+    #[arg(long)]
+    effort: Option<String>,
     /// OpenAI-compatible API root for --engine openai (also $OPENAI_BASE_URL; a bare
     /// host gets /v1). The API key, if the server needs one, comes from $OPENAI_API_KEY
     #[arg(long)]
@@ -67,6 +73,11 @@ struct Args {
     /// the ask engine is the indexing engine, else that engine's default)
     #[arg(long)]
     ask_model: Option<String>,
+    /// Reasoning effort for questions, example inputs and walkthroughs (default:
+    /// --effort when the ask engine is the indexing engine). Another effort alone
+    /// still forks the map's session, which keeps what it read
+    #[arg(long)]
+    ask_effort: Option<String>,
     /// Codex executable (run as `codex app-server`)
     #[arg(long, default_value = "codex")]
     codex: String,
@@ -192,23 +203,23 @@ struct EngineOpts {
     timeout: Duration,
 }
 
-async fn start_engine(kind: engine::Kind, model: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
+async fn start_engine(kind: engine::Kind, model: Option<String>, effort: Option<String>, o: &EngineOpts, root: &Path, cache_dir: &Path) -> Result<engine::Engine, String> {
     let timeout = o.timeout;
     Ok(match kind {
         engine::Kind::Codex => {
-            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, timeout };
+            let cfg = codex::CodexConfig { bin: o.codex.clone(), model, effort, timeout };
             engine::Engine::Codex(codex::Codex::start(cfg, root).await?)
         }
         engine::Kind::Claude => {
-            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, timeout };
+            let cfg = claude::ClaudeConfig { bin: o.claude.clone(), model, effort, timeout };
             engine::Engine::Claude(Arc::new(claude::Claude::start(cfg, root).await?))
         }
         engine::Kind::Anthropic => {
             let model = model.or_else(|| Some(anthropic::DEFAULT_MODEL.to_owned()));
-            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, timeout).await?))
+            engine::Engine::Anthropic(Arc::new(anthropic::Anthropic::start(root, cache_dir, model, effort, timeout).await?))
         }
         engine::Kind::OpenAi => {
-            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, timeout };
+            let cfg = openai::OpenAiConfig { base_url: o.openai_base_url.clone(), api_key: o.openai_api_key.clone(), model, effort, timeout };
             engine::Engine::OpenAi(Arc::new(openai::OpenAi::start(root, cache_dir, cfg).await?))
         }
     })
@@ -263,23 +274,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cfg = config::load()?;
     // First interactive launch without a configuration: set one up, then carry on.
     // Explicit engine flags, one-off actions and non-interactive runs skip it.
-    let engine_flags = args.engine.is_some() || args.model.is_some() || args.ask_engine.is_some() || args.ask_model.is_some() || args.openai_base_url.is_some();
+    let engine_flags = args.engine.is_some()
+        || args.model.is_some()
+        || args.effort.is_some()
+        || args.ask_engine.is_some()
+        || args.ask_model.is_some()
+        || args.ask_effort.is_some()
+        || args.openai_base_url.is_some();
     if cfg.is_none() && !engine_flags && !args.install_skill && !args.forget_sessions && term::interactive() {
         println!("No cxplr configuration yet; let's set it up first (`cxplr --configure` changes it later).\n");
         cfg = Some(configure::run(None).await?);
     }
     let cfg = cfg.unwrap_or_default();
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
-    let mut choice = config::choose(&cfg, args.engine, args.model.clone(), args.ask_engine, args.ask_model.clone());
+    let index_flags = config::Flags { engine: args.engine, model: args.model.clone(), effort: args.effort };
+    let ask_flags = config::Flags { engine: args.ask_engine, model: args.ask_model.clone(), effort: args.ask_effort };
+    let config::Choice { mut index, mut ask } = config::choose(&cfg, index_flags, ask_flags);
     // $OPENAI_MODEL sits between flags and the configuration, like the other OpenAI variables.
-    if choice.engine == engine::Kind::OpenAi && args.model.is_none() {
-        choice.model = env("OPENAI_MODEL").or(choice.model);
+    if index.engine == engine::Kind::OpenAi && args.model.is_none() {
+        index.model = env("OPENAI_MODEL").or(index.model);
     }
-    if choice.ask_engine == engine::Kind::OpenAi && choice.ask_engine != choice.engine && args.ask_model.is_none() {
-        choice.ask_model = env("OPENAI_MODEL").or(choice.ask_model);
+    if ask.engine == engine::Kind::OpenAi && ask.engine != index.engine && args.ask_model.is_none() {
+        ask.model = env("OPENAI_MODEL").or(ask.model);
     }
     if args.install_skill {
-        let path = skill::install(choice.engine).map_err(|e| e.to_string())?;
+        let path = skill::install(index.engine).map_err(|e| e.to_string())?;
         println!("installed the cxplr skill at {}", path.display());
         return Ok(());
     }
@@ -305,20 +324,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         openai_api_key: env("OPENAI_API_KEY").or(cfg.openai_api_key),
         timeout: Duration::from_secs(args.timeout_mins.max(1) * 60),
     };
-    let engine = start_engine(choice.engine, choice.model, &opts, &repo.root, &cache_dir).await?;
-    let same_model = choice.ask_model.as_deref().is_none_or(|m| Some(m) == engine.model());
-    let asker = if choice.ask_engine == choice.engine && same_model {
+    let engine = start_engine(index.engine, index.model, index.effort, &opts, &repo.root, &cache_dir).await?;
+    // The ask side gets its own engine when anything differs; on the same engine,
+    // unset ask settings mean the indexing engine's.
+    let same_engine = ask.engine == index.engine;
+    let model_differs = ask.model.as_deref().is_some_and(|m| Some(m) != engine.model());
+    let effort_differs = ask.effort.is_some() && ask.effort.as_deref() != engine.effort();
+    let asker = if same_engine && !model_differs && !effort_differs {
         None
     } else {
-        Some(start_engine(choice.ask_engine, choice.ask_model, &opts, &repo.root, &cache_dir).await?)
+        let inherit = |own: Option<String>, from: Option<&str>| if same_engine { own.or_else(|| from.map(str::to_owned)) } else { own };
+        let model = inherit(ask.model, engine.model());
+        let effort = inherit(ask.effort, engine.effort());
+        Some(start_engine(ask.engine, model, effort, &opts, &repo.root, &cache_dir).await?)
     };
     // Keys include the model the engine actually uses (the openai engine may pick it).
-    let cache = cache::Cache::open(cache_dir.clone(), choice.engine, engine.model())
+    let cache = cache::Cache::open(cache_dir.clone(), index.engine, engine.model())
         .map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
     let ex = Arc::new(explore::Explorer { repo, cache, engine, asker });
 
     let commit = ex.repo.head().map_or("no git commit".to_owned(), |c| c[..c.len().min(12)].to_owned());
-    let describe = |e: &engine::Engine| format!("{}{}", e.kind().id(), e.model().map_or(String::new(), |m| format!(" ({m})")));
+    let describe = |e: &engine::Engine| {
+        let details: Vec<String> = [e.model().map(str::to_owned), e.effort().map(|x| format!("effort {x}"))].into_iter().flatten().collect();
+        if details.is_empty() { e.kind().id().to_owned() } else { format!("{} ({})", e.kind().id(), details.join(", ")) }
+    };
     let asks = ex.asker.as_ref().map_or(String::new(), |a| format!(", asks {}", describe(a)));
     println!("cxplr: {} ({commit}), engine {}{asks}, cache {}", ex.repo.root.display(), describe(&ex.engine), cache_dir.display());
 

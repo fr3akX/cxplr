@@ -71,6 +71,9 @@ pub struct Meta {
     pub commit: Option<String>,
     pub dirty: bool,
     pub model: Option<String>,
+    /// Reasoning effort the map was made with; `None`: the engine's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub duration_ms: u64,
     pub commands: u32,
     pub input_tokens: u64,

@@ -1,6 +1,6 @@
 [package]
 name = "cxplr"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "cxplr (Code Explore): learn a repository's architecture top-down, then drill in"
 repository = "https://github.com/fr3akX/cxplr"

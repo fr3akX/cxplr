@@ -26,8 +26,11 @@ cited source lines, in a local web UI.
   OpenAI, OpenRouter, vLLM, llama.cpp, Ollama, LM Studio and the like, local or remote.
 - **Separate models for indexing and questions**, e.g. a cheap or local model for the
   maps and a stronger one for questions, whose sessions start from the atlas.
+- **Reasoning effort per role** (`--effort`, `--ask-effort`): a quick index and careful
+  answers, mapped to each engine's own control (Codex effort, Claude Code `--effort`,
+  Claude adaptive thinking, `reasoning_effort`).
 - **Guided setup**: `cxplr --configure` (also on first launch) picks and checks the
-  engines and models and saves them globally.
+  engines, models and efforts and saves them globally.
 
 The exploration is done by [Codex](https://github.com/openai/codex) (default),
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code), a native Anthropic
@@ -74,7 +77,8 @@ ask_engine = "codex"
 openai_base_url = "http://localhost:8080"
 ```
 
-Keys: `engine`, `model`, `ask_engine`, `ask_model`, `openai_base_url`, `openai_api_key`.
+Keys: `engine`, `model`, `effort`, `ask_engine`, `ask_model`, `ask_effort`,
+`openai_base_url`, `openai_api_key`.
 Command-line flags override them, and `$OPENAI_BASE_URL`, `$OPENAI_API_KEY` and
 `$OPENAI_MODEL` override the OpenAI settings. A configured model belongs to its engine:
 `--engine claude` with a configured `openai` model uses Claude's default, not that
@@ -124,6 +128,31 @@ that session. In the A/B test this used fewer tokens than forking the index sess
 with answers as good. `--ask-model` alone switches the model on the indexing engine;
 `--ask-engine` alone uses that engine's default model. Cache keys depend only on the
 indexing engine and model, so changing the ask side never invalidates maps.
+
+### Reasoning effort
+
+`--effort` sets how hard the indexing engine reasons and `--ask-effort` does the same for
+questions, example inputs and walkthroughs (also `effort` / `ask_effort` in the
+configuration, and a question in `--configure`). Without them each engine uses its own
+default. The word is passed to the engine, which checks it:
+
+| Engine | Sent as | Levels | Default |
+| --- | --- | --- | --- |
+| `codex` | the turn's `effort` | whatever the model offers (e.g. `low`, `medium`, `high`) | `model_reasoning_effort` in your Codex config |
+| `claude` | `claude -p --effort` | `low`, `medium`, `high`, `xhigh`, `max` | Claude Code's default (`--restricted` ignores your settings files) |
+| `anthropic` | Claude 5 / Opus and Sonnet 4.6+: adaptive thinking with `output_config.effort`; older models: a thinking budget | `low`, `medium`, `high`, `xhigh`, `max`; `off` only before Claude 4.6 | the API's default (current models always think) |
+| `openai` | `reasoning_effort` | the server's; e.g. OpenAI `minimal`…`high`, llama.cpp chat templates such as Qwen's `none` (thinking off), `low`, `medium`, `xhigh` | the server's |
+
+```sh
+cxplr --effort low --ask-effort high      # quick index, careful answers (Codex)
+cxplr --engine openai --effort none       # a local Qwen without thinking: faster index
+```
+
+On a llama.cpp server running Qwen, `--effort none` mapped a small test repo in 27 s
+instead of 43 s, with 1014 output tokens instead of 1850. Another effort alone keeps the
+indexing engine and model, so questions still fork the map's session (only another engine
+or model starts atlas-seeded sessions). The effort is recorded on each map and shown with
+its model; it is not part of the cache keys.
 
 ### Native Anthropic
 
@@ -223,7 +252,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.10.0 is available (you have 0.9.0): run `cxplr --update`
+cxplr 0.11.0 is available (you have 0.10.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -238,8 +267,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.10.0"
-git tag v0.10.0 && git push origin main v0.10.0
+cargo build && git commit -am "Release 0.11.0"
+git tag v0.11.0 && git push origin main v0.11.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -597,9 +626,11 @@ cxplr [REPO] [OPTIONS]
 | `--open` | | Open the browser once serving (always after `--index`) |
 | `--engine codex\|claude\|anthropic\|openai` | configured, else `codex` | Agent that explores (see [Engines](#engines)) |
 | `--model NAME` | CLI config / `claude-sonnet-5-5` / `$OPENAI_MODEL` | Model; CLI Claude also takes aliases (`sonnet`, `opus`) |
+| `--effort LEVEL` | configured, else engine default | Reasoning effort for indexing (see [Reasoning effort](#reasoning-effort)) |
 | `--openai-base-url URL` | `$OPENAI_BASE_URL` or OpenAI | OpenAI-compatible API root for `--engine openai`; key from `$OPENAI_API_KEY` |
 | `--ask-engine ENGINE` | `--engine` | Engine for questions, example inputs and walkthroughs |
 | `--ask-model NAME` | `--model` (same engine) | Model for questions, example inputs and walkthroughs |
+| `--ask-effort LEVEL` | `--effort` (same engine) | Reasoning effort for questions, example inputs and walkthroughs |
 | `--codex PATH` | `codex` | Codex executable (run as `codex app-server`) |
 | `--claude PATH` | `claude` | Claude Code executable (run as `claude -p`) |
 | `--anthropic-login` | | Browser OAuth login for native Anthropic; saves refreshable credentials and exits |

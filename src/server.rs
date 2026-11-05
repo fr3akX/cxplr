@@ -160,10 +160,12 @@ async fn repo_info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "commit": st.repo.head(),
         "engine": st.engine.kind().id(),
         "model": st.engine.model(),
+        "effort": st.engine.effort(),
         "ask_engine": st.ask_engine().kind().id(),
         "ask_model": st.ask_engine().model(),
-        // Separate ask engine or model: new conversations start seeded with the atlas.
-        "ask_seeded": st.asker.is_some(),
+        "ask_effort": st.ask_engine().effort(),
+        // Another ask engine or model: new conversations start seeded with the atlas.
+        "ask_seeded": st.ask_seeded(),
         "cache": st.cache.dir(),
     }))
 }

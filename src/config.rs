@@ -19,11 +19,16 @@ pub struct Config {
     /// Model for `engine`; absent: the engine's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort for `engine`; absent: the engine's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Engine for questions, example inputs and walkthroughs; absent: `engine`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_engine: Option<Kind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_base_url: Option<String>,
     /// Stored in a private (0600) file; `$OPENAI_API_KEY` wins when set.
@@ -82,29 +87,54 @@ pub fn save(config: &Config) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Engines and models for one run.
-#[derive(Debug, PartialEq)]
-pub struct Choice {
-    pub engine: Kind,
+/// One role's settings from the command line (`--engine`/`--model`/`--effort` or
+/// `--ask-engine`/`--ask-model`/`--ask-effort`).
+#[derive(Debug, Default)]
+pub struct Flags {
+    pub engine: Option<Kind>,
     pub model: Option<String>,
-    pub ask_engine: Kind,
-    pub ask_model: Option<String>,
+    pub effort: Option<String>,
 }
 
-/// Combine command-line flags with the configuration. A configured model only
-/// applies to the engine it was configured for, so `--engine claude` does not
+/// One role's engine, model and reasoning effort for this run (`None`: the engine's
+/// default; on the ask side, the indexing engine's setting when it is the same engine).
+#[derive(Debug, PartialEq)]
+pub struct Pick {
+    pub engine: Kind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Choice {
+    pub index: Pick,
+    pub ask: Pick,
+}
+
+/// Combine command-line flags with the configuration. A configured model or effort
+/// only applies to the engine it was configured for, so `--engine claude` does not
 /// inherit the model of a configured `openai` engine.
-pub fn choose(cfg: &Config, engine: Option<Kind>, model: Option<String>, ask_engine: Option<Kind>, ask_model: Option<String>) -> Choice {
+pub fn choose(cfg: &Config, index: Flags, ask: Flags) -> Choice {
     let cfg_engine = cfg.engine.unwrap_or(Kind::Codex);
-    let engine = engine.unwrap_or(cfg_engine);
-    let model = model.or_else(|| (engine == cfg_engine).then(|| cfg.model.clone()).flatten());
-    let ask_engine = ask_engine.or(cfg.ask_engine).unwrap_or(engine);
-    // The configured ask model belongs to the configured ask engine, or (without one)
+    let engine = index.engine.unwrap_or(cfg_engine);
+    let own = engine == cfg_engine;
+    let configured = |v: &Option<String>, applies: bool| applies.then(|| v.clone()).flatten();
+    let index = Pick {
+        engine,
+        model: index.model.or_else(|| configured(&cfg.model, own)),
+        effort: index.effort.or_else(|| configured(&cfg.effort, own)),
+    };
+    let ask_engine = ask.engine.or(cfg.ask_engine).unwrap_or(engine);
+    // The configured ask settings belong to the configured ask engine, or (without one)
     // to the configured indexing engine.
     let cfg_ask_engine = cfg.ask_engine.unwrap_or(cfg_engine);
-    let applies = ask_engine == cfg_ask_engine && (cfg.ask_engine.is_some() || engine == cfg_engine);
-    let ask_model = ask_model.or_else(|| applies.then(|| cfg.ask_model.clone()).flatten());
-    Choice { engine, model, ask_engine, ask_model }
+    let applies = ask_engine == cfg_ask_engine && (cfg.ask_engine.is_some() || own);
+    let ask = Pick {
+        engine: ask_engine,
+        model: ask.model.or_else(|| configured(&cfg.ask_model, applies)),
+        effort: ask.effort.or_else(|| configured(&cfg.ask_effort, applies)),
+    };
+    Choice { index, ask }
 }
 
 #[cfg(test)]
@@ -115,36 +145,43 @@ mod tests {
         toml::from_str(text).unwrap()
     }
 
-    #[test]
-    fn flags_override_and_models_stay_with_their_engine() {
-        let c = cfg("engine = \"openai\"\nmodel = \"qwen\"\nask_engine = \"codex\"\nask_model = \"gpt-6.1-sol\"\n");
-        // Configured as is.
-        assert_eq!(
-            choose(&c, None, None, None, None),
-            Choice { engine: Kind::OpenAi, model: Some("qwen".into()), ask_engine: Kind::Codex, ask_model: Some("gpt-6.1-sol".into()) }
-        );
-        // Another indexing engine drops the configured model but keeps the ask side.
-        let other = choose(&c, Some(Kind::Claude), None, None, None);
-        assert_eq!((other.engine, other.model.as_deref(), other.ask_engine), (Kind::Claude, None, Kind::Codex));
-        assert_eq!(other.ask_model.as_deref(), Some("gpt-6.1-sol"));
-        // Flags win.
-        let flags = choose(&c, None, Some("big".into()), Some(Kind::OpenAi), Some("small".into()));
-        assert_eq!((flags.model.as_deref(), flags.ask_engine, flags.ask_model.as_deref()), (Some("big"), Kind::OpenAi, Some("small")));
-        // Another ask engine drops the configured ask model.
-        assert_eq!(choose(&c, None, None, Some(Kind::Claude), None).ask_model, None);
+    fn pick(engine: Kind, model: Option<&str>, effort: Option<&str>) -> Pick {
+        Pick { engine, model: model.map(str::to_owned), effort: effort.map(str::to_owned) }
+    }
+
+    fn flags(engine: Option<Kind>, model: Option<&str>, effort: Option<&str>) -> Flags {
+        Flags { engine, model: model.map(str::to_owned), effort: effort.map(str::to_owned) }
     }
 
     #[test]
-    fn an_ask_model_without_an_ask_engine_belongs_to_the_indexing_engine() {
-        let c = cfg("engine = \"claude\"\nmodel = \"sonnet\"\nask_model = \"opus\"\n");
-        let same = choose(&c, None, None, None, None);
-        assert_eq!((same.ask_engine, same.ask_model.as_deref()), (Kind::Claude, Some("opus")));
-        let moved = choose(&c, Some(Kind::Codex), None, None, None);
-        assert_eq!((moved.ask_engine, moved.ask_model), (Kind::Codex, None));
+    fn flags_override_and_settings_stay_with_their_engine() {
+        let c = cfg("engine = \"openai\"\nmodel = \"qwen\"\neffort = \"low\"\nask_engine = \"codex\"\nask_model = \"gpt-6.1-sol\"\nask_effort = \"high\"\n");
+        // Configured as is.
+        assert_eq!(
+            choose(&c, Flags::default(), Flags::default()),
+            Choice { index: pick(Kind::OpenAi, Some("qwen"), Some("low")), ask: pick(Kind::Codex, Some("gpt-6.1-sol"), Some("high")) }
+        );
+        // Another indexing engine drops the configured model and effort but keeps the ask side.
+        let other = choose(&c, flags(Some(Kind::Claude), None, None), Flags::default());
+        assert_eq!(other.index, pick(Kind::Claude, None, None));
+        assert_eq!(other.ask, pick(Kind::Codex, Some("gpt-6.1-sol"), Some("high")));
+        // Flags win.
+        let set = choose(&c, flags(None, Some("big"), Some("medium")), flags(Some(Kind::OpenAi), Some("small"), Some("none")));
+        assert_eq!(set.index, pick(Kind::OpenAi, Some("big"), Some("medium")));
+        assert_eq!(set.ask, pick(Kind::OpenAi, Some("small"), Some("none")));
+        // Another ask engine drops the configured ask model and effort.
+        assert_eq!(choose(&c, Flags::default(), flags(Some(Kind::Claude), None, None)).ask, pick(Kind::Claude, None, None));
+    }
+
+    #[test]
+    fn ask_settings_without_an_ask_engine_belong_to_the_indexing_engine() {
+        let c = cfg("engine = \"claude\"\nmodel = \"sonnet\"\nask_model = \"opus\"\nask_effort = \"max\"\n");
+        assert_eq!(choose(&c, Flags::default(), Flags::default()).ask, pick(Kind::Claude, Some("opus"), Some("max")));
+        assert_eq!(choose(&c, flags(Some(Kind::Codex), None, None), Flags::default()).ask, pick(Kind::Codex, None, None));
         // No configuration: Codex with its own defaults.
         assert_eq!(
-            choose(&Config::default(), None, None, None, None),
-            Choice { engine: Kind::Codex, model: None, ask_engine: Kind::Codex, ask_model: None }
+            choose(&Config::default(), Flags::default(), Flags::default()),
+            Choice { index: pick(Kind::Codex, None, None), ask: pick(Kind::Codex, None, None) }
         );
     }
 
