@@ -10,6 +10,8 @@ cited source lines, in a local web UI.
   content-addressed cache that survives commits.
 - **Simulation**: watch N inputs travel a data flow; generate concrete example inputs
   that take different branches, with the data at every step.
+- **Code walkthrough**: step forward and back through the code one example input runs,
+  with notes and values at each step and its component lit up on the map.
 - **Source viewer** with tabs that keep their place, a functions/classes outline, find
   in file and across the repository, syntax highlighting and code navigation through
   language servers (Rust, Python, TS/JS, Go, C/C++, Scala), with text-search fallback.
@@ -126,7 +128,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.7.0 is available (you have 0.6.0): run `cxplr --update`
+cxplr 0.8.0 is available (you have 0.7.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -141,8 +143,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.7.0"
-git tag v0.7.0 && git push origin main v0.7.0
+cargo build && git commit -am "Release 0.8.0"
+git tag v0.8.0 && git push origin main v0.8.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
