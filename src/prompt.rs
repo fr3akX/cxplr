@@ -3,6 +3,7 @@
 //! which interfaces the component has to explain.
 
 use crate::map::{Map, Node};
+use crate::repo::FileFilter;
 use std::fmt::Write;
 
 /// Part of every cache key: bump when prompts or the map schema change meaning.
@@ -154,4 +155,26 @@ scope. Keep node ids for parts that did not change, and re-verify every citation
 ",
     );
     p
+}
+
+/// `prompt` plus the file types this exploration covers, when they are limited.
+pub fn with_file_types(mut prompt: String, filter: &FileFilter) -> String {
+    if filter.is_empty() {
+        return prompt;
+    }
+    let list = |types: &[String]| types.iter().map(|t| format!("`{t}`")).collect::<Vec<_>>().join(", ");
+    prompt.push_str("\nFiles in scope: this exploration covers only ");
+    if !filter.only.is_empty() {
+        let _ = write!(prompt, "files of these types (extension or file name): {}", list(&filter.only));
+        if !filter.skip.is_empty() {
+            let _ = write!(prompt, ", except {}", list(&filter.skip));
+        }
+    } else {
+        let _ = write!(prompt, "files other than these types (extension or file name): {}", list(&filter.skip));
+    }
+    prompt.push_str(
+        ". Do not read or cite other files (documentation, text, data), and do not make \
+components or flows for them; components consist of in-scope files.\n",
+    );
+    prompt
 }

@@ -110,6 +110,18 @@ struct Args {
     /// Components with fewer text lines stay leaves while indexing
     #[arg(long, default_value_t = 300)]
     min_lines: usize,
+    /// Index only files of these types: extensions or file names, comma-separated
+    /// (e.g. `rs,toml` or `py,Dockerfile`). Saved for the project (<cache>/files.json)
+    /// and used by later runs until changed
+    #[arg(long, value_name = "TYPES")]
+    file_types: Option<String>,
+    /// Leave files of these types out of indexing (e.g. `md,txt`). Saved like --file-types;
+    /// giving either flag replaces the saved filter
+    #[arg(long, value_name = "TYPES")]
+    skip_file_types: Option<String>,
+    /// Forget the project's file-type filter: every file counts again
+    #[arg(long, conflicts_with_all = ["file_types", "skip_file_types"])]
+    all_file_types: bool,
     /// Open the browser once the server is up (always after --index)
     #[arg(long)]
     open: bool,
@@ -315,8 +327,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(unix)]
     raise_open_file_limit();
-    let repo = repo::Repo::open(&args.repo)?;
+    let mut repo = repo::Repo::open(&args.repo)?;
     let cache_dir = args.cache_dir.unwrap_or_else(|| repo.root.join(repo::CACHE_DIR_NAME));
+    // Which files count for indexing: given now (and then saved), else the project's saved filter.
+    let filter_given = args.all_file_types || args.file_types.is_some() || args.skip_file_types.is_some();
+    repo.filter = if filter_given {
+        let parse = |list: &Option<String>| list.as_deref().map(repo::FileFilter::parse_list).unwrap_or_default();
+        repo::FileFilter { only: parse(&args.file_types), skip: parse(&args.skip_file_types) }
+    } else {
+        repo::FileFilter::load(&cache_dir)?
+    };
     let opts = EngineOpts {
         codex: args.codex,
         claude: args.claude,
@@ -341,6 +361,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Keys include the model the engine actually uses (the openai engine may pick it).
     let cache = cache::Cache::open(cache_dir.clone(), index.engine, engine.model())
         .map_err(|e| format!("cache {}: {e} (use --cache-dir for read-only checkouts)", cache_dir.display()))?;
+    if filter_given {
+        if !repo.filter.is_empty() && repo.manifest(&[".".to_owned()]).is_empty() {
+            return Err(format!("no files in {} match the file types ({}); the filter was not saved", repo.root.display(), repo.filter.describe()).into());
+        }
+        repo.filter.save(&cache_dir)?;
+    }
     let ex = Arc::new(explore::Explorer { repo, cache, engine, asker });
 
     let commit = ex.repo.head().map_or("no git commit".to_owned(), |c| c[..c.len().min(12)].to_owned());
@@ -350,6 +376,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let asks = ex.asker.as_ref().map_or(String::new(), |a| format!(", asks {}", describe(a)));
     println!("cxplr: {} ({commit}), engine {}{asks}, cache {}", ex.repo.root.display(), describe(&ex.engine), cache_dir.display());
+    if !ex.repo.filter.is_empty() {
+        println!("file types: {} (saved for this project; change with --file-types / --skip-file-types, or --all-file-types)", ex.repo.filter.describe());
+    }
 
     if args.forget_sessions {
         // Each engine's registry once (an ask engine of the same kind shares it).

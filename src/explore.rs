@@ -157,6 +157,7 @@ impl Explorer {
                 l.node.paths.clone(),
             ),
         };
+        let full_prompt = prompt::with_file_types(full_prompt, &self.repo.filter);
         // The map describes the files as they were when the exploration started.
         let manifest = self.repo.manifest(&paths);
         let commit = self.repo.head();
@@ -173,7 +174,7 @@ impl Explorer {
         let (session, prompt, refreshed) = match (stale, self.cache.session(scope)) {
             (Some((changed, total)), Some(session)) => {
                 progress(format!("Refreshing {label} in its session {session} ({total} files changed)"));
-                (session, prompt::refresh(&changed, total), true)
+                (session, prompt::with_file_types(prompt::refresh(&changed, total), &self.repo.filter), true)
             }
             _ => {
                 progress(format!("Exploring {label} with {} (read-only)", self.engine.kind().id()));

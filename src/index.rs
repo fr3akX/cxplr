@@ -33,6 +33,8 @@ pub struct Summary {
     pub failed: usize,
     pub skipped_small: usize,
     pub skipped_not_narrower: usize,
+    /// Components with no files of the indexed types.
+    pub skipped_no_files: usize,
     pub deepest: usize,
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -217,6 +219,10 @@ impl Queue {
                 continue;
             }
             let files = ex.repo.manifest(&node.paths).len();
+            if files == 0 {
+                summary.skipped_no_files += 1;
+                continue;
+            }
             if files >= parent.files {
                 summary.skipped_not_narrower += 1;
                 continue;
@@ -233,11 +239,16 @@ impl Queue {
 pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
     let started = Instant::now();
     let mut summary = Summary::default();
-    let root = Item { scope: String::new(), label: ex.repo.name.clone(), files: ex.repo.manifest(&[".".to_owned()]).len() };
+    let files = ex.repo.manifest(&[".".to_owned()]).len();
+    if files == 0 && !ex.repo.filter.is_empty() {
+        return Err(format!("no files match the file types to index ({}); check --file-types / --skip-file-types", ex.repo.filter.describe()));
+    }
+    let root = Item { scope: String::new(), label: ex.repo.name.clone(), files };
     let mut queue = Queue { pending: VecDeque::from([root]), seen: HashSet::new() };
     let mut running: JoinSet<(Item, ProgressBar, Duration, Result<Map, String>)> = JoinSet::new();
+    let types = if ex.repo.filter.is_empty() { String::new() } else { format!(", {}", ex.repo.filter.describe()) };
     println!(
-        "indexing {} (depth {}, {} parallel, components under {} lines stay leaves)",
+        "indexing {} (depth {}, {} parallel, components under {} lines stay leaves{types})",
         ex.repo.root.display(),
         opts.depth.map_or_else(|| "full".to_owned(), |d| d.to_string()),
         opts.jobs,
@@ -341,7 +352,7 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
     }
     display.clear();
     println!(
-        "indexed in {}: {} explored, {} already cached, {} failed, {} levels deep; leaves: {} small, {} not narrower than their parent; {} tokens",
+        "indexed in {}: {} explored, {} already cached, {} failed, {} levels deep; leaves: {} small, {} not narrower than their parent, {} without files to index; {} tokens",
         fmt_duration(started.elapsed()),
         summary.explored,
         summary.cached,
@@ -349,6 +360,7 @@ pub async fn run(ex: Arc<Explorer>, opts: Options) -> Result<Summary, String> {
         summary.deepest,
         summary.skipped_small,
         summary.skipped_not_narrower,
+        summary.skipped_no_files,
         fmt_usage(summary.input_tokens, summary.cached_input_tokens, summary.output_tokens)
     );
     Ok(summary)

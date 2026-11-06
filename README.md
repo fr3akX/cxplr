@@ -7,9 +7,10 @@ cited source lines, in a local web UI.
 - **Maps at every level**: system, component, sub-component…, each with interactions,
   data flows and `file:line` evidence checked against the code; hide components you do
   not need to declutter a map.
-- **Full-project indexing** up front (`--index`), with a live progress bar and model
-  stats (tokens, cache share, context used of the window) per running exploration, then
-  browsing straight from a content-addressed cache that survives commits.
+- **Full-project indexing** up front (`--index`), optionally limited to the code's file
+  types (`--file-types rs,toml`), with a live progress bar and model stats (tokens,
+  cache share, context used of the window) per running exploration, then browsing
+  straight from a content-addressed cache that survives commits.
 - **Simulation**: watch N inputs travel a data flow; generate concrete example inputs
   that take different branches, with the data at every step.
 - **Code walkthrough**: step forward and back (or autoplay) through the code one example
@@ -254,7 +255,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.13.0 is available (you have 0.12.0): run `cxplr --update`
+cxplr 0.14.0 is available (you have 0.13.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -269,8 +270,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.13.0"
-git tag v0.13.0 && git push origin main v0.13.0
+cargo build && git commit -am "Release 0.14.0"
+git tag v0.14.0 && git push origin main v0.14.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -297,6 +298,9 @@ not been explored shows **Explore now**, and a stale map offers **Refresh**.
 | `--depth N\|full` | 2 | Levels to map: 1 = system, 2 = system and its components, …; `full` = the whole hierarchy |
 | `--jobs N` | 4 | Explorations running at the same time (1–16) |
 | `--min-lines N` | 300 | Components with fewer text lines stay leaves (the source view covers them) |
+| `--file-types TYPES` | all | Index only these file types: extensions or file names, e.g. `rs,toml` (see below) |
+| `--skip-file-types TYPES` | none | Leave these file types out of indexing, e.g. `md,txt` |
+| `--all-file-types` | | Forget the project's file-type filter |
 
 The system map is explored first, then every explorable component, level by level.
 Indexing is resumable and incremental: fresh maps are skipped, so re-running after an
@@ -329,10 +333,37 @@ The same live figures appear in the web UI while a map is explored and while a q
 example run or walkthrough runs, with a meter for the context window.
 
 A component becomes a leaf when it is not explorable, is an external system or actor,
-has fewer than `--min-lines` lines, or covers no fewer files than the map it appears
-in. The last rule guarantees that even `--depth full` terminates. Full depth can mean
-dozens to hundreds of explorations (each typically 2–7 minutes and 150–700k input
-tokens); raise `--min-lines` to keep the hierarchy coarser.
+has fewer than `--min-lines` lines, has no files of the indexed types, or covers no
+fewer files than the map it appears in. The last rule guarantees that even `--depth
+full` terminates. Full depth can mean dozens to hundreds of explorations (each
+typically 2–7 minutes and 150–700k input tokens); raise `--min-lines` to keep the
+hierarchy coarser.
+
+### File types
+
+By default every file counts. In a Rust project you may not want documentation, notes or
+data mapped as components; limit indexing to the code:
+
+```sh
+cxplr --index --file-types rs,toml           # only Rust sources and Cargo files
+cxplr --index --skip-file-types md,txt       # everything except Markdown and text
+```
+
+Types are extensions or whole file names (`py,Dockerfile`), separated by commas,
+case-insensitive. The filter decides which files a component consists of:
+
+- the agent is told to read and cite only those files and not to make components or
+  flows for others;
+- the cache's content keys and staleness use only those files, so editing `README.md` or
+  `docs/` does not make maps stale;
+- component sizes for `--min-lines` count only those files, and components with none of
+  them stay leaves.
+
+The filter is saved for the project in `<cache>/files.json` and used by every later run,
+including browsing, until changed: giving either flag replaces it, `--all-file-types`
+removes it. cxplr prints the active filter at startup, and refuses one that matches no
+files. Changing it changes which files the maps cover, so maps whose files changed go
+stale. The source viewer, search and questions are not limited.
 
 ## The map
 
@@ -606,6 +637,7 @@ checkouts.
 | `traces/<key>.json` | Example inputs per map content and flow |
 | `walks/<key>.json` | Code walkthrough per example input |
 | `sessions.json`, `sessions-claude.json`, `sessions-anthropic.json`, `sessions-openai.json` | Per-engine session registries (for `--forget-sessions`) |
+| `files.json` | The project's file-type filter (`--file-types`, `--skip-file-types`) |
 | `anthropic-sessions/<id>.json`, `openai-sessions/<id>.json` | Private conversation histories of the built-in agent |
 | `atlas/` | The Markdown atlas |
 
