@@ -5,7 +5,8 @@ interact and its main data flows, then lets you drill into any component, down t
 cited source lines, in a local web UI.
 
 - **Maps at every level**: system, component, sub-component…, each with interactions,
-  data flows and `file:line` evidence checked against the code.
+  data flows and `file:line` evidence checked against the code; hide components you do
+  not need to declutter a map.
 - **Full-project indexing** up front (`--index`), with a live progress bar and model
   stats (tokens, cache share, context used of the window) per running exploration, then
   browsing straight from a content-addressed cache that survives commits.
@@ -253,7 +254,7 @@ At most every 6 hours, a cxplr installed by the installer checks GitHub Releases
 background and prints a one-line notice when a newer version exists:
 
 ```
-cxplr 0.12.0 is available (you have 0.11.0): run `cxplr --update`
+cxplr 0.13.0 is available (you have 0.12.0): run `cxplr --update`
 ```
 
 `cxplr --update` downloads and installs it with the same installer; installed cxplr
@@ -268,8 +269,8 @@ Releases are built by GitHub Actions with [dist](https://github.com/axodotdev/ca
 
 ```sh
 # bump `version` in Cargo.toml, then:
-cargo build && git commit -am "Release 0.12.0"
-git tag v0.12.0 && git push origin main v0.12.0
+cargo build && git commit -am "Release 0.13.0"
+git tag v0.13.0 && git push origin main v0.13.0
 ```
 
 The tag triggers builds for the four targets and a GitHub release with the archives,
@@ -351,6 +352,13 @@ tokens); raise `--min-lines` to keep the hierarchy coarser.
   are listed under **Diagnostics**.
 - Drag a box to move it when labels overlap; edges follow. Positions are kept per map
   in browser storage; **Reset layout** discards them.
+- Hide components you do not need (an external service, a logging sidecar): **hide** next
+  to it under **Components**, **Hide from map** in its details, or `H` with the box
+  selected. The box and its arrows leave the map and the rest is laid out again; it is
+  listed under **Hidden** with **show** / **show all**. Hiding is a view setting, kept per
+  map in browser storage (across commits): maps, the atlas, questions and indexing still
+  include the component. Flows and simulations skip steps that touch a hidden component,
+  and code walkthroughs light up only visible components.
 - A stale map shows which files changed since it was made; **Refresh** updates it
   (see [Sessions](#sessions)). **Re-explore** maps a fresh level again.
 - Mouse wheel zooms, dragging the background pans, **Fit** or `F` fits the map, the

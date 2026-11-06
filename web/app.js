@@ -19,6 +19,7 @@ const state = {
   view: { x: 0, y: 0, k: 1 },
   poll: null,
   names: new Map(), // scope -> display name, for breadcrumbs before a map loads
+  hidden: new Set(), // ids of components hidden on the current map
 };
 
 // ---------- utilities ----------
@@ -433,9 +434,10 @@ function savedPositions() {
 
 function savePositions() {
   const at = state.layout.at;
-  const positions = Object.fromEntries(Object.entries(at).map(([id, p]) => [id, [Math.round(p.cx), Math.round(p.cy)]]));
+  const moved = Object.fromEntries(Object.entries(at).map(([id, p]) => [id, [Math.round(p.cx), Math.round(p.cy)]]));
   try {
-    localStorage.setItem(layoutKey(), JSON.stringify(positions));
+    // Keep the saved positions of hidden components for when they are shown again.
+    localStorage.setItem(layoutKey(), JSON.stringify({ ...savedPositions(), ...moved }));
   } catch {
     // Storage full or disabled: the drag still applies for this view.
   }
@@ -449,8 +451,62 @@ function moveNode(p, cx, cy) {
   p.y = cy - p.h / 2;
 }
 
+/** Components hidden on this map, kept per map in this browser (across commits). */
+function hiddenKey() {
+  return `cxplr:hidden:${state.repo?.root}:${state.scope}`;
+}
+
+function loadHidden(map) {
+  let ids = [];
+  try {
+    ids = JSON.parse(localStorage.getItem(hiddenKey())) || [];
+  } catch {
+    // Unreadable or storage disabled: show everything.
+  }
+  const known = new Set(map.nodes.map((n) => n.id));
+  return new Set(ids.filter((id) => known.has(id)));
+}
+
+function isHidden(id) {
+  return state.hidden.has(id);
+}
+
+/** The map as drawn: hidden components and the arrows touching them left out. */
+function visibleMap(map) {
+  if (!state.hidden.size) return map;
+  return {
+    ...map,
+    nodes: map.nodes.filter((n) => !isHidden(n.id)),
+    edges: map.edges.filter((e) => !isHidden(e.from) && !isHidden(e.to)),
+  };
+}
+
+/** Hide or show components, then lay out what remains. */
+function setHidden(ids, hide) {
+  for (const id of ids) {
+    if (hide) state.hidden.add(id);
+    else state.hidden.delete(id);
+  }
+  try {
+    if (state.hidden.size) localStorage.setItem(hiddenKey(), JSON.stringify([...state.hidden]));
+    else localStorage.removeItem(hiddenKey());
+  } catch {
+    // Storage disabled: applies to this view only.
+  }
+  // A hidden box (or an arrow touching one) cannot stay selected.
+  const sel = state.selected;
+  const edge = sel?.type === 'edge' ? state.map.edges[sel.index] : null;
+  const gone = sel?.type === 'node' ? isHidden(sel.id) : Boolean(edge) && (isHidden(edge.from) || isHidden(edge.to));
+  if (hide && gone) state.selected = null;
+  stopSim();
+  state.layout = computeLayout(state.map);
+  renderGraph();
+  fit();
+  renderPanel();
+}
+
 function computeLayout(map) {
-  const L = layout(map);
+  const L = layout(visibleMap(map));
   const saved = savedPositions();
   state.customLayout = false;
   for (const [id, [cx, cy]] of Object.entries(saved || {})) {
@@ -464,6 +520,7 @@ function computeLayout(map) {
 
 function showMap(map) {
   state.map = map;
+  state.hidden = loadHidden(map);
   state.layout = computeLayout(map);
   const crumbs = map.meta?.crumbs;
   if (crumbs) {
@@ -488,12 +545,14 @@ function renderGraph() {
 /** Edge geometry follows node positions; called again while a node is dragged. */
 function renderEdges() {
   const { map, layout: L } = state;
+  const shown = (e) => !isHidden(e.from) && !isHidden(e.to);
   const pairCount = new Map();
   const pairSeen = new Map();
   const pairKey = (e) => [e.from, e.to].sort().join('\u0000');
-  map.edges.forEach((e) => pairCount.set(pairKey(e), (pairCount.get(pairKey(e)) || 0) + 1));
+  map.edges.forEach((e) => { if (shown(e)) pairCount.set(pairKey(e), (pairCount.get(pairKey(e)) || 0) + 1); });
 
   state.edgeGeom = map.edges.map((e) => {
+    if (!shown(e)) return null;
     if (e.from === e.to) {
       const a = L.at[e.from];
       const x = a.x + a.w - 24;
@@ -507,6 +566,8 @@ function renderEdges() {
 
   $('#edges').innerHTML = map.edges.map((e, i) => {
     const g = state.edgeGeom[i];
+    // Arrows of hidden components keep an empty placeholder, so elements stay in edge-index order.
+    if (!g) return `<g class="edge hidden-edge" data-edge="${i}"><path class="line"></path></g>`;
     return `<g class="edge k-${esc(e.kind)}" data-edge="${i}">
       <path class="line" d="${g.d}" marker-end="url(#arrow)"></path>
       <path class="hit" d="${g.d}"><title>${esc(`${nodeById(e.from)?.name} → ${nodeById(e.to)?.name}: ${e.label}`)}</title></path>
@@ -522,7 +583,7 @@ function nodeTransform(p) {
 
 function renderNodes() {
   const { map, layout: L } = state;
-  $('#nodes').innerHTML = map.nodes.map((node) => {
+  $('#nodes').innerHTML = map.nodes.filter((node) => !isHidden(node.id)).map((node) => {
     const p = L.at[node.id];
     const drill = node.paths.length > 0;
     return `<g class="node ${esc(node.kind)}" data-node="${esc(node.id)}" transform="${nodeTransform(p)}" style="--kc:${kindColor(node.kind)}">
@@ -571,6 +632,7 @@ function applyHighlight() {
     const litNodes = new Set(steps.flatMap((s) => [s.from, s.to]));
     const badges = new Map(); // edge index or ghost key -> { mid, numbers }
     steps.forEach((s, n) => {
+      if (isHidden(s.from) || isHidden(s.to)) return; // numbering stays that of the flow
       let i = map.edges.findIndex((e) => e.from === s.from && e.to === s.to);
       if (i < 0) i = map.edges.findIndex((e) => e.from === s.to && e.to === s.from);
       let key, mid;
@@ -777,6 +839,7 @@ function renderPanelContent() {
       <div class="actions">
         ${node.paths.length ? '<button class="primary" data-act="drill" type="button">Explore inside ›</button>' : ''}
         <button data-act="ask" type="button">Ask about this</button>
+        <button data-act="${isHidden(node.id) ? 'show' : 'hide'}" type="button" title="${isHidden(node.id) ? 'Show it on the map again' : 'Leave it out of the map, with its arrows (H)'}">${isHidden(node.id) ? 'Show on map' : 'Hide from map'}</button>
       </div>
       <h3>Paths</h3>
       ${node.paths.length ? '<ul class="list">' + node.paths.map((p) => `<li><span class="path-link" data-src="${esc(p)}">${esc(p)}</span></li>`).join('') + '</ul>' : '<p class="muted">Not implemented in this repository.</p>'}
@@ -815,7 +878,7 @@ function renderPanelContent() {
       ${meta?.model ? ` · ${esc(meta.model)}` : ''}${meta?.effort ? ` · effort ${esc(meta.effort)}` : ''}
       ${meta?.session ? ` · session <code title="${esc(sessionHint(meta))}">${esc(meta.session.slice(0, 8))}</code>` : ''}
     </p>
-    <p class="meta">${map.nodes.length} nodes · ${map.edges.length} interactions ·
+    <p class="meta">${map.nodes.length} nodes${state.hidden.size ? ` (${state.hidden.size} hidden · <a class="path-link" data-act="show-all">show all</a>)` : ''} · ${map.edges.length} interactions ·
       <span class="${verified === allEvidence.length ? '' : 'warn'}">${verified}/${allEvidence.length} citations verified</span></p>
     ${staleBanner()}
     <div class="actions"><button data-act="reexplore" type="button">${state.freshness?.state === 'stale' ? 'Refresh' : 'Re-explore'}</button>
@@ -838,13 +901,15 @@ function renderPanelContent() {
         ${inner ? `<a class="path-link" data-follow="${esc(s.to)}" data-from="${esc(s.from)}">Follow inside ${esc(nodeById(s.to).name)} ›</a>` : ''}</span></div></li>`;
     }).join('') + '</ul><h3>Example inputs</h3><div id="trace-box"></div>' : ''}
     <h3>Components</h3>
-    <ul class="list">${map.nodes.map((n) => `<li class="click" data-sel-node="${esc(n.id)}"><span class="swatch" style="--kc:${kindColor(n.kind)}"></span><b>${esc(n.name)}</b>
-      <span class="muted"> ${esc(n.kind)}</span>${n.paths.length ? ` <a class="path-link drill-${childState(n.id)}" data-drill="${esc(n.id)}">${esc(drillLabel(n))}</a>` : ''}</li>`).join('')}</ul>
+    <ul class="list">${map.nodes.filter((n) => !isHidden(n.id)).map(componentItem).join('')}</ul>
+    ${state.hidden.size ? `<h3>Hidden (${state.hidden.size}) · <a class="path-link" data-act="show-all">show all</a></h3>
+      <ul class="list">${map.nodes.filter((n) => isHidden(n.id)).map(componentItem).join('')}</ul>` : ''}
     ${map.diagnostics.length ? `<h3>Diagnostics</h3><details><summary>${map.diagnostics.length} issues in the agent's answer</summary>
       <ul>${map.diagnostics.map((d) => `<li class="meta">${esc(d)}</li>`).join('')}</ul></details>` : ''}
     <h3>How to read</h3>
     <p class="meta">Click a box or arrow for details and evidence. Double-click a box, or use “Explore inside”, to zoom in one level.
-      Drag a box to move it; positions are kept per map in this browser.
+      Drag a box to move it; positions are kept per map in this browser. Hide a box you do not need with H (or “hide” in the list below);
+      hidden boxes and their arrows leave the map until shown again.
       Arrows point the way requests or data travel. Dashed boxes are external systems or actors.</p>
     <div class="legend">
       ${legendLine('call / http / rpc', '')}${legendLine('event / queue', '7 4')}
@@ -866,9 +931,18 @@ function legendLine(text, dash) {
   return `<span><svg width="34" height="8"><line x1="0" y1="4" x2="34" y2="4" stroke="var(--edge)" stroke-width="1.6" stroke-dasharray="${dash}"></line></svg>${esc(text)}</span>`;
 }
 
+function componentItem(n) {
+  const hidden = isHidden(n.id);
+  return `<li class="click${hidden ? ' is-hidden' : ''}" data-sel-node="${esc(n.id)}"><span class="swatch" style="--kc:${kindColor(n.kind)}"></span><b>${esc(n.name)}</b>
+    <span class="muted"> ${esc(n.kind)}</span>${n.paths.length ? ` <a class="path-link drill-${childState(n.id)}" data-drill="${esc(n.id)}">${esc(drillLabel(n))}</a>` : ''}
+    <button type="button" class="vis" ${hidden ? 'data-show' : 'data-hide'}="${esc(n.id)}" title="${hidden ? 'Show it on the map' : 'Hide it from the map'}">${hidden ? 'show' : 'hide'}</button></li>`;
+}
+
 $('#panel').addEventListener('click', (e) => {
-  const t = e.target.closest('[data-sim], [data-sim-stop], [data-follow], [data-src], [data-drill], [data-sel-node], [data-sel-edge], [data-flow], [data-act]');
+  const t = e.target.closest('[data-hide], [data-show], [data-sim], [data-sim-stop], [data-follow], [data-src], [data-drill], [data-sel-node], [data-sel-edge], [data-flow], [data-act]');
   if (!t) return;
+  if (t.dataset.hide !== undefined) return setHidden([t.dataset.hide], true);
+  if (t.dataset.show !== undefined) return setHidden([t.dataset.show], false);
   if (t.dataset.sim !== undefined) return startFlowSim(Number(t.dataset.sim));
   if (t.dataset.simStop !== undefined) return stopSim(true);
   if (t.dataset.follow !== undefined) return followInside(t.dataset.follow, t.dataset.from);
@@ -880,6 +954,9 @@ $('#panel').addEventListener('click', (e) => {
   else if (t.dataset.act === 'back') state.selected = null;
   else if (t.dataset.act === 'drill') return go(childScope(state.selected.id));
   else if (t.dataset.act === 'ask') return switchTab('ask');
+  else if (t.dataset.act === 'hide') return setHidden([state.selected.id], true);
+  else if (t.dataset.act === 'show') return setHidden([state.selected.id], false);
+  else if (t.dataset.act === 'show-all') return setHidden([...state.hidden], false);
   else if (t.dataset.act === 'reexplore') {
     localStorage.removeItem(layoutKey()); // node ids may mean something else in the new map
     return start(state.scope, true);
@@ -1580,6 +1657,7 @@ function nodeForPath(path, line = 0) {
   let bestLen = -1;
   let bestGap = Infinity;
   for (const n of state.map?.nodes || []) {
+    if (isHidden(n.id)) continue;
     const len = Math.max(-1, ...n.paths.map((raw) => pathMatch(raw, path)));
     if (len < 0 || len < bestLen) continue;
     let gap = Infinity;
@@ -2843,6 +2921,10 @@ window.addEventListener('keydown', (e) => {
   }
   if (e.target.closest('input, textarea') || modalOpen) return;
   if (e.key === 'f' || e.key === 'F') fit();
+  const sel = state.selected;
+  if ((e.key === 'h' || e.key === 'H') && !e.ctrlKey && !e.metaKey && !e.altKey && sel?.type === 'node' && state.map) {
+    setHidden([sel.id], !isHidden(sel.id));
+  }
 });
 
 // ---------- start ----------

@@ -264,6 +264,10 @@ pre.payload { background: var(--code-bg); border-radius: 5px; padding: 4px 8px; 
 .list li { padding: 6px 8px; border-radius: 6px; border: 1px solid transparent; }
 .list li.click { cursor: pointer; }
 .list li.click:hover, .list li.active { border-color: var(--border); background: var(--bg); }
+.list li .vis { float: right; margin-left: 6px; padding: 0 7px; font-size: 11px; line-height: 18px; color: var(--muted); visibility: hidden; }
+.list li:hover .vis, .list li.is-hidden .vis { visibility: visible; }
+.list li.is-hidden b { color: var(--muted); }
+.edge.hidden-edge { display: none; }
 .ev { display: flex; gap: 8px; align-items: baseline; }
 .ev .mark { flex: none; width: 14px; font-weight: 700; }
 .ev .mark.ok { color: var(--ok); }
